@@ -91,7 +91,9 @@ jobs:
         shell: bash
         run: |
           file="$RUNNER_TEMP/lo-download/$(basename '${{ matrix.lo_file }}')"
-          if command -v sha256sum >/dev/null; then actual=$(sha256sum "$file" | cut -d' ' -f1); else actual=$(shasum -a 256 "$file" | cut -d' ' -f1); fi
+          # ★ 从 stdin 读:Windows 上路径含反斜杠时,sha256sum 会在输出行首加一个 "\",
+          #   按文件名传参得到的是 "\<hash>",比较永远失败(首次 CI 实测)
+          if command -v sha256sum >/dev/null; then actual=$(sha256sum < "$file" | cut -d' ' -f1); else actual=$(shasum -a 256 < "$file" | cut -d' ' -f1); fi
           echo "expected ${{ matrix.lo_sha256 }}"
           echo "actual   $actual"
           test "$actual" = "${{ matrix.lo_sha256 }}"
