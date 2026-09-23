@@ -14,6 +14,8 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 const MAX_FRAME_BYTES = 64 * 1024 * 1024
+// 低于 conformance 测试的 240s,保证是请求先超时、带着诊断信息失败
+const REQUEST_TIMEOUT_MS = 90_000
 
 export class ProtocolError extends Error {}
 
@@ -102,8 +104,20 @@ export class HelperClient {
     const header = Buffer.alloc(5)
     header.writeUInt32BE(payload.length, 0)
     header.writeUInt8(0, 4)
+    /*
+      单个请求有自己的超时,并把 helper 的 stderr 尾部带进错误:不然请求卡住时只会得到
+      node:test 的「test timed out after 240000ms」,看不出卡在 helper 的哪一步
+      (helper 在 stderr 打阶段日志,见 ncw-office-helper.cxx 的 stage())。
+    */
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return
+        reject(new ProtocolError(`${method} got no response within ${REQUEST_TIMEOUT_MS}ms; helper stderr tail:\n${this.stderr.slice(-2000)}`))
+      }, REQUEST_TIMEOUT_MS)
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value) },
+        reject: (error) => { clearTimeout(timer); reject(error) }
+      })
       this.child.stdin.write(Buffer.concat([header, payload]))
     })
   }

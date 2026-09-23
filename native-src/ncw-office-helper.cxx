@@ -252,6 +252,7 @@ class Engine {
     if (doc_ != nullptr) failWith("invalid_operation", "a document is already open in this helper");
     // Language=en-US:单元格输入(小数点、布尔、函数名)按固定区域设置解释,
     // 不随用户系统区域漂移 —— 否则同一个 cells.set 在德语系统上会把 1.5 读成文本。
+    stage("open: loading " + format);
     lok::Document* doc = office_->documentLoad(fileUrl(path).c_str(), "Language=en-US");
     if (doc == nullptr) {
       char* error = office_->getError();
@@ -272,10 +273,15 @@ class Engine {
       而同样的命令第二次就好了 —— 典型的「偶现」。
     */
     doc->registerCallback(&Engine::onCallback, this);
+    stage("open: loaded, type " + std::to_string(doc->getDocumentType()));
     doc->initializeForRendering("{}");
     for (int i = 0; i < 100 && events_.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    stage("open: initialized, " + std::to_string(events_.load()) + " callbacks");
+#ifdef _WIN32
     activateDocumentFrame();
+    stage("open: document frame activated");
+#endif
     if (kind_ == DocKind::Text) loadParagraphStyles();
     return describe();
   }
@@ -288,10 +294,18 @@ class Engine {
    * Windows 上隐藏窗口收不到激活消息,活动框架为空,命令落到桌面上找不到处理者,
    * 表现为「每条编辑命令都 Failed to dispatch / 等不到回执」(Windows CI 实测,回调照常在发)。
    *
+   * 只在 Windows 上调用:macOS / Linux 不需要,而且在 macOS CI 上加了它之后 PDF 导出会让
+   * LibreOffice 崩溃("Unspecified Application Error",本机未复现)。
+   *
    * SfxLokHelper::setView 在**切换到非当前视图**时会调用 Desktop::setActiveFrame,
    * 对当前视图则直接返回。所以借一个临时视图:建新视图(它成为当前)→ 切回原视图
    * (触发 setActiveFrame)→ 销毁临时视图。★ 看起来多余,删掉它 Windows 就不能编辑。
    */
+  static void stage(const std::string& message) {
+    std::fprintf(stderr, "[ncw-office-helper] %s\n", message.c_str());
+    std::fflush(stderr);
+  }
+
   void activateDocumentFrame() {
     int original = doc_->getView();
     int temporary = doc_->createView();
@@ -1003,6 +1017,8 @@ int main(int argc, char** argv) {
     if (idValue == nullptr || !idValue->isNumber()) continue;
     double id = idValue->number;
     std::string method = request.str("method");
+    std::fprintf(stderr, "[ncw-office-helper] request %s\n", method.c_str());
+    std::fflush(stderr);
     const Json* params = request.get("params");
     static const Json kEmpty;
     const Json& p = params != nullptr ? *params : kEmpty;
