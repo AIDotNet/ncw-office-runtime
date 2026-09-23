@@ -51,6 +51,8 @@
 #include <io.h>
 #include <windows.h>
 #include <cwchar>
+// 消息循环与窗口子类化(namespace win)用的是 user32;写在源码里,不依赖构建脚本记得加链接参数
+#pragma comment(lib, "user32.lib")
 #define ncw_dup _dup
 #define ncw_dup2 _dup2
 #define ncw_read _read
