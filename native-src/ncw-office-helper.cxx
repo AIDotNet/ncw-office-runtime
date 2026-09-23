@@ -252,8 +252,12 @@ class Engine {
     if (doc_ != nullptr) failWith("invalid_operation", "a document is already open in this helper");
     // Language=en-US:单元格输入(小数点、布尔、函数名)按固定区域设置解释,
     // 不随用户系统区域漂移 —— 否则同一个 cells.set 在德语系统上会把 1.5 读成文本。
+    // Batch=true:无人值守 —— 加载期间的对话框一律静默取消(DialogCancelMode::LOKSilent)。
+    // ★ 没人能点一个 helper 进程里弹出的对话框。Windows 上 LibreOfficeKit 用的是真实窗口后端,
+    //   Calc / Impress / Draw 加载完导入后卡在建视图那一步(导入进度已到 100%,
+    //   documentLoad 永不返回,CI 实测);soffice --headless 在同一台机器上正常。
     stage("open: loading " + format);
-    lok::Document* doc = office_->documentLoad(fileUrl(path).c_str(), "Language=en-US");
+    lok::Document* doc = office_->documentLoad(fileUrl(path).c_str(), "Language=en-US,Batch=true");
     if (doc == nullptr) {
       char* error = office_->getError();
       failWith("unsupported_format", std::string("LibreOffice could not load the document: ") + (error != nullptr ? error : "unknown error"));
