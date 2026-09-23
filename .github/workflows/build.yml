@@ -141,20 +141,21 @@ jobs:
 
       # ★ 临时诊断(Windows 上 xlsx/pptx/pdf 的 documentLoad 卡住,docx 正常)。
       #   已排除:LibreOffice 安装本身(soffice --headless 能转换)、环境变量白名单、加载期对话框(Batch=true)。
-      #   现在抓卡住时的全部线程栈(cdb),找死锁点。结果写成 warning annotation(公开可见)。
-      #   定位并修复后连同 test/diag-hang.mjs 一起删掉。
+      #   第一轮栈:Calc 公式栏子窗口跨线程 SetWindowPos 死锁(helper 已预置配置隐藏它)。
+      #   本轮:三种文档各开一次,卡住的抓线程 0/1 的栈。结果写成 warning annotation(公开可见)。
+      #   annotation 单条上限 4096 字符,所以按 3900 切。定位并修复后连同 test/diag-hang.mjs 一起删掉。
       - name: Windows diagnostics (stacks of a hung load)
         if: runner.os == 'Windows'
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: bash
         run: |
-          node test/diag-hang.mjs xlsx 2>&1 | grep -v Fontconfig > "$RUNNER_TEMP/diag.txt"
+          node test/diag-hang.mjs xlsx pptx pdf 2>&1 | grep -v Fontconfig > "$RUNNER_TEMP/diag.txt"
           node -e '
             const s = require("fs").readFileSync(process.argv[1], "utf8")
             const enc = (t) => t.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")
-            for (let i = 0, n = 1; i < s.length && n <= 8; i += 6000, n++) {
-              console.log(`::warning title=hung load stacks ${n}::` + enc(s.slice(i, i + 6000)))
+            for (let i = 0, n = 1; i < s.length && n <= 9; i += 3900, n++) {
+              console.log(`::warning title=hung load stacks ${n}::` + enc(s.slice(i, i + 3900)))
             }' "$RUNNER_TEMP/diag.txt"
 
       # 失败时把输出尾部写成 annotation:job 日志要登录才能下载,annotation 在公开 API 里可见,

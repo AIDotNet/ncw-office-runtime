@@ -39,6 +39,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -964,6 +966,35 @@ class Engine {
   }
 };
 
+/**
+ * 在 helper 私有的 LibreOffice profile 里预置配置,必须在 lok_init 之前写。
+ *
+ * 需求:Windows 上 LibreOfficeKit 只有线程模式(Windows 后端不支持 unipoll)。Calc 加载完
+ * 导入后会建公式栏(ScInputWindow,子窗口 id FID_INPUTLINE_STATUS = 26100),里面的
+ * 名称框 ComboBox 在 helper 线程里对 LibreOffice 主循环线程拥有的窗口调 SetWindowPos,
+ * 而主循环线程在等 helper 线程持有的 SolarMutex —— 死锁,documentLoad 永不返回
+ * (CI 上用 cdb 抓栈确认:线程 0 停在 NtUserSetWindowPos ← ComboBox::Resize ← sclo)。
+ * helper 不需要公式栏(编辑走 UNO 命令),所以让它根本不被创建。
+ *
+ * ★ 所有平台都写:macOS / Linux 上公式栏同样没用,一条代码路径比按平台分叉好测。
+ *   已存在的配置文件不覆盖(宿主每个 helper 用新的工作目录,正常情况下不会已存在)。
+ */
+void seedProfile(const std::string& profileDir) {
+  namespace fs = std::filesystem;
+  std::error_code error;
+  fs::path user = fs::u8path(profileDir) / "user";
+  fs::create_directories(user, error);
+  fs::path config = user / "registrymodifications.xcu";
+  if (fs::exists(config, error)) return;
+  std::ofstream out(config, std::ios::binary);
+  out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+         "<oor:items xmlns:oor=\"http://openoffice.org/2001/registry\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\""
+         " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n"
+         "<item oor:path=\"/org.openoffice.Office.Views/Windows\"><node oor:name=\"26100\" oor:op=\"replace\">"
+         "<prop oor:name=\"Visible\" oor:op=\"fuse\"><value>false</value></prop></node></item>\n"
+         "</oor:items>\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -978,6 +1009,7 @@ int main(int argc, char** argv) {
 #endif
 
   std::string home = std::getenv("HOME") != nullptr ? std::getenv("HOME") : ".";
+  seedProfile(home + "/lo-profile");
   std::string profile = fileUrl(home + "/lo-profile");
   std::string loPath = libreOfficePath(argc, argv);
 #ifdef _WIN32
