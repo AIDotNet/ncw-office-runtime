@@ -1,0 +1,3 @@
+# 本机编译产物:每个平台在自己的机器上由 scripts/build-helper.mjs 生成并登记摘要
+native/
+.DS_Store

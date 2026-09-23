@@ -1,0 +1,50 @@
+{
+  "publisher": "ncw",
+  "name": "office-runtime",
+  "displayName": "Office Runtime",
+  "description": "Document engine for NextCoWork office plugins: hosts LibreOfficeKit in an isolated helper process per document.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "engines": {
+    "nextcowork": ">=0.3.1"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "permissions": [],
+  "optionalPermissions": [],
+  "hostPermissions": [],
+  "nativeComponents": [
+    {
+      "id": "libreoffice",
+      "version": "26.8",
+      "protocol": 1,
+      "targets": [],
+      "license": {
+        "spdx": "Apache-2.0 AND MPL-2.0",
+        "notices": "licenses/NOTICE.txt"
+      }
+    }
+  ],
+  "contributes": {
+    "documentEngines": [
+      {
+        "id": "office",
+        "component": "libreoffice",
+        "formats": [
+          "docx",
+          "docm",
+          "xlsx",
+          "xlsm",
+          "pptx",
+          "pptm",
+          "pdf"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build:helper": "node scripts/build-helper.mjs",
+    "register": "node scripts/register-targets.mjs",
+    "test": "node --test test/conformance.test.mjs"
+  }
+}

@@ -1,0 +1,198 @@
+# 四个平台编译 ncw-office-helper,并对真实 LibreOffice 跑协议一致性测试。
+#
+# 需求:引擎是原生代码,只能在各自的平台上编译和验证;这台机器能证明的只有它自己。
+# 每个平台装官方 LibreOffice(版本与 SHA-256 锁死),编译 helper,跑 test/conformance.test.mjs。
+# 汇总 job 把四份摘要登记进清单,产出一个列齐四个平台的插件目录。
+#
+# ★ 产物**不含 LibreOffice 运行时**:把几百 MB 的 LibreOffice 打进插件包,
+#   要等 NextCoWork 支持大包安装、完成代码签名与许可证审查之后再做。
+#   现在的产物只能在装了 LibreOffice 的开发机上配合 --lo-path 使用。
+#
+# ★ 升级 LibreOffice 时同时改 LO_VERSION 与四个 SHA-256(取自官方下载页的 .mirrorlist),
+#   并同步 native-src/third_party/libreofficekit 的头文件分支。版本离开 stable 目录后
+#   下载地址要换成 downloadarchive.documentfoundation.org 的对应路径。
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LO_VERSION: 26.8.0
+  LO_BASE: https://download.documentfoundation.org/libreoffice/stable/26.8.0
+
+jobs:
+  helper:
+    name: Helper (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+            lo_file: mac/aarch64/LibreOffice_26.8.0_MacOS_aarch64.dmg
+            lo_sha256: 8858d8058da4f862f47559486814e65efc27294da67c5e4bb56b006b1ee59f89
+          - os: macos-15-intel
+            target: darwin-x64
+            lo_file: mac/x86_64/LibreOffice_26.8.0_MacOS_x86-64.dmg
+            lo_sha256: 2dcbce4894e01bc1ecd594658e2cbda70ff7bfcd0b310f35d38887797172d09e
+          - os: windows-latest
+            target: win32-x64
+            lo_file: win/x86_64/LibreOffice_26.8.0_Win_x86-64.msi
+            lo_sha256: 4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95
+          - os: ubuntu-latest
+            target: linux-x64
+            lo_file: deb/x86_64/LibreOffice_26.8.0_Linux_x86-64_deb.tar.gz
+            lo_sha256: d0a6031a3837e48f9854e6d2da6489b9fadbd814afa4741fa32a197741663a22
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache LibreOffice download
+        id: lo-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/lo-download
+          key: lo-${{ matrix.lo_sha256 }}
+
+      - name: Download LibreOffice
+        if: steps.lo-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/lo-download"
+          curl -fL --retry 5 --retry-delay 10 -o "$RUNNER_TEMP/lo-download/$(basename '${{ matrix.lo_file }}')" "$LO_BASE/${{ matrix.lo_file }}"
+
+      # 下载的 LibreOffice 会被 helper 加载进进程,摘要对不上必须当场失败
+      - name: Verify LibreOffice checksum
+        shell: bash
+        run: |
+          file="$RUNNER_TEMP/lo-download/$(basename '${{ matrix.lo_file }}')"
+          if command -v sha256sum >/dev/null; then actual=$(sha256sum "$file" | cut -d' ' -f1); else actual=$(shasum -a 256 "$file" | cut -d' ' -f1); fi
+          echo "expected ${{ matrix.lo_sha256 }}"
+          echo "actual   $actual"
+          test "$actual" = "${{ matrix.lo_sha256 }}"
+
+      - name: Install LibreOffice (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          file="$RUNNER_TEMP/lo-download/$(basename '${{ matrix.lo_file }}')"
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/lo-dmg" "$file"
+          mkdir -p "$RUNNER_TEMP/lo"
+          cp -R "$RUNNER_TEMP/lo-dmg/LibreOffice.app" "$RUNNER_TEMP/lo/"
+          hdiutil detach "$RUNNER_TEMP/lo-dmg"
+          echo "NCW_LO_PATH=$RUNNER_TEMP/lo/LibreOffice.app/Contents/Frameworks" >> "$GITHUB_ENV"
+
+      # 装 deb 而不是只解包:apt 会把 LibreOffice 依赖的系统库一起装上
+      - name: Install LibreOffice (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          file="$RUNNER_TEMP/lo-download/$(basename '${{ matrix.lo_file }}')"
+          mkdir -p "$RUNNER_TEMP/lo-deb"
+          tar -xzf "$file" -C "$RUNNER_TEMP/lo-deb"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "$RUNNER_TEMP"/lo-deb/*/DEBS/*.deb
+          program=$(ls -d /opt/libreoffice*/program | head -1)
+          test -n "$program"
+          echo "NCW_LO_PATH=$program" >> "$GITHUB_ENV"
+
+      # 管理员安装(/a)只解包不注册,不需要改动系统;program 目录的位置随 MSI 布局而定,按 soffice.exe 找
+      - name: Install LibreOffice (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP "lo-download\$(Split-Path '${{ matrix.lo_file }}' -Leaf)"
+          $target = Join-Path $env:RUNNER_TEMP 'lo'
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', "`"$file`"", '/qn', "TARGETDIR=`"$target`"") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "msiexec failed: $($process.ExitCode)" }
+          $soffice = Get-ChildItem $target -Recurse -Filter soffice.exe | Select-Object -First 1
+          if ($null -eq $soffice) { throw 'soffice.exe not found after extraction' }
+          "NCW_LO_PATH=$($soffice.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build helper
+        run: node scripts/build-helper.mjs
+
+      - name: Protocol conformance against real LibreOffice
+        run: npm test
+
+      - name: Upload helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ matrix.target }}
+          # 只含 native/<target>/:helper 与 target.json(摘要)
+          path: native
+          if-no-files-found: error
+          retention-days: 14
+
+  plugin:
+    name: Assemble plugin (all platforms)
+    needs: helper
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download helpers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: helper-*
+          path: native
+          merge-multiple: true
+
+      # 摘要在 register-targets 里逐个对二进制重新核对;四个平台缺一个就失败 ——
+      # NextCoWork 安装器会因为任何一个声明平台的入口缺失而拒装整个包
+      - name: Register all targets
+        run: |
+          node scripts/register-targets.mjs
+          node -e '
+            const m = require("./package.json")
+            const got = m.nativeComponents[0].targets.map((t) => `${t.platform}-${t.arch}`).sort().join(",")
+            const want = "darwin-arm64,darwin-x64,linux-x64,win32-x64"
+            if (got !== want) { console.error(`expected ${want}, got ${got}`); process.exit(1) }
+            console.log(`targets: ${got}`)
+          '
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncw.office-runtime-${{ github.sha }}
+          path: |
+            package.json
+            LICENSE
+            dist/
+            licenses/
+            native/
+          if-no-files-found: error
+          retention-days: 30

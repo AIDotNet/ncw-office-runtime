@@ -1,0 +1,19 @@
+NextCoWork Office Runtime — third-party notices
+================================================
+
+1. ncw-office-helper (native/<platform>-<arch>/ncw-office-helper)
+   Part of NextCoWork, licensed under the Apache License 2.0.
+
+2. LibreOfficeKit headers (native-src/third_party/libreofficekit/*.h, *.hxx)
+   Copyright the LibreOffice contributors.
+   Licensed under the Mozilla Public License, v. 2.0 — https://mozilla.org/MPL/2.0/
+   Source: https://github.com/LibreOffice/core/tree/libreoffice-26-8/include/LibreOfficeKit
+   The headers are used unmodified; they are compiled into the helper only as
+   declarations of the LibreOfficeKit C ABI.
+
+3. LibreOffice runtime
+   NOT included in this package. The helper loads a LibreOffice installation at runtime
+   (next to the helper, or via --lo-path during development). If a LibreOffice runtime
+   is ever distributed with this plugin, its licenses (MPL-2.0, LGPL-3.0-or-later and the
+   licenses of its bundled third-party components), source-code offers and trademark
+   terms must be reviewed for that exact build and added here before release.
