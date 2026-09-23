@@ -139,8 +139,23 @@ jobs:
       - name: Build helper
         run: node scripts/build-helper.mjs
 
+      # 失败时把输出尾部写成 annotation:job 日志要登录才能下载,annotation 在公开 API 里可见,
+      # 不用拿凭据也能看到是哪一步、LibreOffice 报了什么
       - name: Protocol conformance against real LibreOffice
-        run: npm test
+        shell: bash
+        run: |
+          set +e
+          npm test 2>&1 | tee "$RUNNER_TEMP/conformance.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" != "0" ]; then
+            grep -v Fontconfig "$RUNNER_TEMP/conformance.log" | tail -n 60 | node -e '
+              let s = ""
+              process.stdin.on("data", (d) => { s += d }).on("end", () => {
+                const e = s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")
+                console.log("::error title=conformance output::" + e)
+              })'
+          fi
+          exit "$status"
 
       - name: Upload helper
         uses: actions/upload-artifact@v4

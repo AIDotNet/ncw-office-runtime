@@ -280,11 +280,12 @@ class Engine {
       default: canSave = false;
     }
     /*
-      ★ canExport 报空:引擎本身能导出 PDF 等格式,但宿主还没有「导出到哪里」的协议方法
-      与路径策略。报出来的话 UI / Agent 会画出一个没有落点的导出按钮。接上导出通道后再报。
+      可导出格式:PDF + 同类的无宏 OOXML。原先报空,是因为宿主还没有导出方法与路径策略;
+      现在宿主有了 `export`(目标路径由核心给、不覆盖已有文件),所以如实报出来。
+      ★ 不报跨类格式(docx → xlsx):LibreOffice 会拒绝或产出空壳,画出来就是一个必失败的按钮。
     */
     std::string out = "{\"capabilities\":{\"operations\":[" + ops + "],\"canSave\":" + (canSave ? "true" : "false") +
-                      ",\"canExport\":[],\"canUndo\":false,\"macros\":{\"list\":false,\"run\":false}}";
+                      ",\"canExport\":[" + exportList() + "],\"canUndo\":false,\"macros\":{\"list\":false,\"run\":false}}";
     out += ",\"documentType\":" + quote(kindName(kind_)) + ",\"parts\":" + std::to_string(doc_->getParts()) + ",\"partNames\":[";
     int parts = doc_->getParts();
     for (int i = 0; i < parts && i < 1000; ++i) {
@@ -356,12 +357,31 @@ class Engine {
 
   // ─────── 保存 ───────
 
+  std::vector<std::string> exportFormats() const {
+    switch (kind_) {
+      case DocKind::Text: return {"pdf", "docx"};
+      case DocKind::Spreadsheet: return {"pdf", "xlsx"};
+      case DocKind::Presentation: return {"pdf", "pptx"};
+      case DocKind::Drawing: return {"pdf"};
+      default: return {};
+    }
+  }
+
+  std::string exportList() const {
+    std::string out;
+    for (const std::string& format : exportFormats()) out += (out.empty() ? "" : ",") + quote(format);
+    return out;
+  }
+
+  /**
+   * 写到宿主给的路径。允许的格式 = 文档自己的格式(保存)+ exportFormats(导出)。
+   * ★ 其余一律拒绝:把 docx 文档按 xlsx 过滤器写出去,LibreOffice 可能报成功却产出空壳文件。
+   */
   void saveAs(const std::string& path, const std::string& format) {
     requireDocument();
-    static const char* kFormats[] = {"docx", "docm", "xlsx", "xlsm", "pptx", "pptm", "pdf"};
-    bool known = false;
-    for (const char* f : kFormats) known = known || format == f;
-    if (!known) failWith("unsupported_format", "unsupported save format: " + format);
+    bool allowed = format == format_;
+    for (const std::string& candidate : exportFormats()) allowed = allowed || format == candidate;
+    if (!allowed) failWith("unsupported_format", "cannot write a " + std::string(kindName(kind_)) + " document as ." + format);
     if (!doc_->saveAs(fileUrl(path).c_str(), format.c_str(), nullptr)) {
       char* error = office_->getError();
       failWith("io", std::string("LibreOffice failed to save: ") + (error != nullptr ? error : "unknown error"));

@@ -167,6 +167,22 @@ describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, (
     assert.equal(reopened.parts, 3)
   })
 
+  test('exports unsaved edits to PDF, and refuses cross-type formats', { timeout: TIMEOUT }, async () => {
+    const file = fixture('docx', 'export.docx')
+    const pdf = join(work, 'export.pdf')
+    const client = await start()
+    const opened = await client.request('document.open', { path: file, format: 'docx' })
+    assert.deepEqual(opened.capabilities.canExport, ['pdf', 'docx'])
+    await client.request('document.apply', {
+      operations: [{ kind: 'text.insert', target: { generation: 1, ref: 'document' }, position: 'end', text: 'export me' }]
+    })
+    await client.request('document.saveAs', { path: pdf, format: 'pdf' })
+    const bytes = readFileSync(pdf)
+    assert.equal(bytes.subarray(0, 5).toString('latin1'), '%PDF-')
+    assert.ok(bytes.length > 1000, `pdf is suspiciously small: ${bytes.length}`)
+    await assert.rejects(client.request('document.saveAs', { path: join(work, 'export.xlsx'), format: 'xlsx' }), (e) => e.code === 'unsupported_format')
+  })
+
   test('.pdf opens read-only: no operations and no in-place save', { timeout: TIMEOUT }, async () => {
     const file = fixture('pdf', 'scan.pdf')
     const before = readFileSync(file)
