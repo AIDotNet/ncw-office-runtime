@@ -222,6 +222,16 @@ class Engine {
   static void onCallback(int type, const char* payload, void* data) {
     auto* self = static_cast<Engine*>(data);
     self->events_.fetch_add(1);
+    {
+      // 诊断用:最近的回调类型。命令超时时写进错误信息(Windows 上排查回执丢失,见 runUno)
+      std::lock_guard<std::mutex> guard(self->mutex_);
+      self->recentTypes_.push_back(type);
+      if (self->recentTypes_.size() > 16) self->recentTypes_.pop_front();
+      if (type == LOK_CALLBACK_UNO_COMMAND_RESULT) {
+        self->unoResults_ += 1;
+        self->lastUnoResult_ = payload != nullptr ? std::string(payload).substr(0, 300) : "";
+      }
+    }
     if (payload == nullptr) return;
     if (type == LOK_CALLBACK_SEARCH_RESULT_SELECTION || type == LOK_CALLBACK_SEARCH_NOT_FOUND) {
       std::lock_guard<std::mutex> guard(self->mutex_);
@@ -265,8 +275,30 @@ class Engine {
     doc->initializeForRendering("{}");
     for (int i = 0; i < 100 && events_.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    activateDocumentFrame();
     if (kind_ == DocKind::Text) loadParagraphStyles();
     return describe();
+  }
+
+  /**
+   * 让这份文档的窗口成为桌面的「活动框架」。
+   *
+   * 需求:postUnoCommand 经 comphelper::dispatchCommand 派发,目标取的是
+   * Desktop::getActiveFrame()。macOS / Linux 上加载完的隐藏窗口会自动成为活动框架;
+   * Windows 上隐藏窗口收不到激活消息,活动框架为空,命令落到桌面上找不到处理者,
+   * 表现为「每条编辑命令都 Failed to dispatch / 等不到回执」(Windows CI 实测,回调照常在发)。
+   *
+   * SfxLokHelper::setView 在**切换到非当前视图**时会调用 Desktop::setActiveFrame,
+   * 对当前视图则直接返回。所以借一个临时视图:建新视图(它成为当前)→ 切回原视图
+   * (触发 setActiveFrame)→ 销毁临时视图。★ 看起来多余,删掉它 Windows 就不能编辑。
+   */
+  void activateDocumentFrame() {
+    int original = doc_->getView();
+    int temporary = doc_->createView();
+    if (temporary < 0 || temporary == original) return;
+    doc_->setView(original);
+    doc_->destroyView(temporary);
+    doc_->setView(original);
   }
 
   std::string describe() {
@@ -402,6 +434,9 @@ class Engine {
   };
   std::deque<SearchEvent> searches_;
   std::vector<std::string> paragraphStyles_;
+  std::deque<int> recentTypes_;
+  int unoResults_ = 0;
+  std::string lastUnoResult_;
   std::atomic<int> events_{0};
 
   void requireDocument() const {
@@ -442,6 +477,16 @@ class Engine {
       results_.clear();
     }
     doc_->postUnoCommand(command.c_str(), args.c_str(), true);
+    /*
+      ★ 派发失败时 LibreOffice 不会发回执,只在 getError 里留一句 "Failed to dispatch"
+      (doc_postUnoCommand → comphelper::dispatchCommand 返回 false)。不先查它的话,
+      表现是每条命令都干等满 15 秒超时 —— Windows CI 上首次就是这样把整组测试拖到超时的。
+    */
+    if (char* error = office_->getError()) {
+      std::string message = error;
+      office_->freeError(error);
+      if (message.find("Failed to dispatch") != std::string::npos) failWith("io", command + ": " + message);
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCommandTimeoutMs);
     for (;;) {
@@ -455,8 +500,12 @@ class Engine {
         }
       }
       if (cv_.wait_until(lock, deadline) == std::cv_status::timeout && results_.empty()) {
-        // 带上回调计数:0 = 引擎根本没在派发回调(事件循环没跑),>0 = 只是这条命令没回执
-        failWith("timeout", command + " did not complete within the engine timeout (" + std::to_string(events_.load()) + " engine callbacks seen)");
+        // 诊断信息:回调总数(0 = 事件循环没跑)、最近的回调类型、收到过几条命令回执及最后一条的内容
+        std::string types;
+        for (int t : recentTypes_) types += (types.empty() ? "" : ",") + std::to_string(t);
+        failWith("timeout", command + " did not complete within the engine timeout (" + std::to_string(events_.load()) +
+                                " engine callbacks seen; recent types [" + types + "]; " + std::to_string(unoResults_) +
+                                " command results so far; last: " + lastUnoResult_ + ")");
       }
     }
   }
