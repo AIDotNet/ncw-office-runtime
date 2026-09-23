@@ -50,6 +50,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include <cwchar>
 #define ncw_dup _dup
 #define ncw_dup2 _dup2
 #define ncw_read _read
@@ -202,6 +203,131 @@ std::string libreOfficePath(int argc, char** argv) {
 #endif
 }
 
+// ─────────────────────────── Windows:在 LibreOffice 主线程上处理请求 ───────────────────────────
+
+#ifdef _WIN32
+/*
+  需求:Windows 上 LibreOfficeKit 只有线程模式 —— unipoll 只在无头后端(svpinst.cxx)里实现,
+  Windows 后端(vcl/win)不支持。线程模式下 LibreOffice 的主循环跑在它自己的 lo_startmain 线程,
+  文档窗口也归那个线程所有;helper 若在自己的线程里调 LibreOfficeKit,Calc / Impress / Draw
+  建视图时会对那些窗口调 SetWindowPos —— 这是一次跨线程的同步 SendMessage,而主循环线程正在
+  等 helper 线程持有的 SolarMutex:死锁,documentLoad 永不返回(CI 上用 cdb 抓栈确认,
+  线程 0 停在 NtUserSetWindowPos,调用方分别是 Calc 公式栏与 SfxViewShell::SetBorderPixel)。
+  普通的 LibreOffice 不会遇到它,因为所有界面操作本来就在主线程。
+
+  做法:找到 VCL 在主线程上建的隐藏窗口(类名 SALCOMWND),子类化它;stdin 读到的请求
+  排进队列并向它发一条注册消息,于是请求在 LibreOffice 自己的消息循环里、在主线程上被处理。
+  处理中需要等回调时不能阻塞(回调也由这个线程的消息循环派发),改为边跑消息循环边检查
+  (见 Engine::waitUntil 与 pause)。macOS / Linux 不走这条路,行为不变。
+*/
+namespace win {
+
+using RequestHandler = void (*)(const std::string& frame);
+
+UINT g_requestMessage = 0;
+HWND g_comWindow = nullptr;
+DWORD g_mainThread = 0;
+WNDPROC g_originalProc = nullptr;
+RequestHandler g_handler = nullptr;
+std::mutex g_queueMutex;
+std::deque<std::string> g_queue;
+bool g_draining = false;  // 只在 LibreOffice 主线程上读写
+
+bool onLibreOfficeMainThread() { return g_mainThread != 0 && GetCurrentThreadId() == g_mainThread; }
+
+/** 跑一会儿消息循环:LibreOffice 的定时器、异步派发、回调刷新都靠它推进 */
+void pump(int ms) {
+  auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  for (;;) {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now >= end) return;
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end - now).count();
+    MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(remaining), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+  }
+}
+
+void drain() {
+  // ★ 嵌套保护:处理请求时 pump 会把后续请求的消息也派发进来,那时不能开始处理下一个 ——
+  //   两个请求交错执行,修订号和回执就对不上了。它们留在队列里,由外层这个循环接着处理。
+  if (g_draining) return;
+  g_draining = true;
+  for (;;) {
+    std::string frame;
+    {
+      std::lock_guard<std::mutex> guard(g_queueMutex);
+      if (g_queue.empty()) break;
+      frame = std::move(g_queue.front());
+      g_queue.pop_front();
+    }
+    g_handler(frame);
+  }
+  g_draining = false;
+}
+
+LRESULT CALLBACK comWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+  if (message == g_requestMessage) {
+    drain();
+    return 0;
+  }
+  return CallWindowProcW(g_originalProc, hwnd, message, wParam, lParam);
+}
+
+BOOL CALLBACK findComWindow(HWND hwnd, LPARAM lParam) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != GetCurrentProcessId()) return TRUE;  // 别的进程(例如并行的另一个 helper)的窗口
+  wchar_t name[32] = {};
+  if (GetClassNameW(hwnd, name, 32) > 0 && std::wcscmp(name, L"SALCOMWND") == 0) {
+    *reinterpret_cast<HWND*>(lParam) = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/** 找到 VCL 主线程的隐藏窗口并接管它的消息。找不到返回 false,调用方退回旧路径 */
+bool attach(RequestHandler handler) {
+  HWND found = nullptr;
+  EnumWindows(&findComWindow, reinterpret_cast<LPARAM>(&found));
+  if (found == nullptr) return false;
+  g_requestMessage = RegisterWindowMessageW(L"NcwOfficeHelperRequest");
+  if (g_requestMessage == 0) return false;
+  g_handler = handler;
+  g_comWindow = found;
+  g_mainThread = GetWindowThreadProcessId(found, nullptr);
+  // ★ 先取原窗口过程再替换:反过来的话,替换后、赋值前到达的消息会 CallWindowProc(nullptr)
+  g_originalProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(found, GWLP_WNDPROC));
+  if (g_originalProc == nullptr) return false;
+  SetWindowLongPtrW(found, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&comWindowProc));
+  return true;
+}
+
+void post(std::string frame) {
+  {
+    std::lock_guard<std::mutex> guard(g_queueMutex);
+    g_queue.push_back(std::move(frame));
+  }
+  PostMessageW(g_comWindow, g_requestMessage, 0, 0);
+}
+
+}  // namespace win
+#endif
+
+/** 让出一段时间。Windows 上身处 LibreOffice 主线程时跑消息循环,否则睡眠 */
+void pause(int ms) {
+#ifdef _WIN32
+  if (win::onLibreOfficeMainThread()) {
+    win::pump(ms);
+    return;
+  }
+#endif
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
 // ─────────────────────────── 引擎 ───────────────────────────
 
 enum class DocKind { Text, Spreadsheet, Presentation, Drawing, Other };
@@ -281,8 +407,8 @@ class Engine {
     doc->registerCallback(&Engine::onCallback, this);
     stage("open: loaded, type " + std::to_string(doc->getDocumentType()));
     doc->initializeForRendering("{}");
-    for (int i = 0; i < 100 && events_.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (int i = 0; i < 100 && events_.load() == 0; ++i) pause(20);
+    pause(200);
     stage("open: initialized, " + std::to_string(events_.load()) + " callbacks");
 #ifdef _WIN32
     activateDocumentFrame();
@@ -486,6 +612,28 @@ class Engine {
   }
 
   /**
+   * 等条件成立或超时。
+   *
+   * ★ Windows 上请求在 LibreOffice 主线程里处理,而回调也由这个线程的消息循环派发 ——
+   *   在这里阻塞等条件变量,回调永远不会来。所以那种情况下改为边跑消息循环边检查。
+   */
+  template <class Predicate>
+  bool waitUntil(std::unique_lock<std::mutex>& lock, std::chrono::steady_clock::time_point deadline, Predicate predicate) {
+#ifdef _WIN32
+    if (win::onLibreOfficeMainThread()) {
+      for (;;) {
+        if (predicate()) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        lock.unlock();
+        win::pump(10);
+        lock.lock();
+      }
+    }
+#endif
+    return cv_.wait_until(lock, deadline, predicate);
+  }
+
+  /**
    * 派发一条 UNO 命令并等它的完成回执。
    *
    * ★ 按 commandName 配对,而不是「收到任意一条就算」:引擎有时会为之前的命令迟到地
@@ -519,7 +667,7 @@ class Engine {
           // 解析不了的回执不是我们等的那一条
         }
       }
-      if (cv_.wait_until(lock, deadline) == std::cv_status::timeout && results_.empty()) {
+      if (!waitUntil(lock, deadline, [this] { return !results_.empty(); })) {
         // 诊断信息:回调总数(0 = 事件循环没跑)、最近的回调类型、收到过几条命令回执及最后一条的内容
         std::string types;
         for (int t : recentTypes_) types += (types.empty() ? "" : ",") + std::to_string(t);
@@ -579,7 +727,7 @@ class Engine {
     }
     runUno(".uno:ExecuteSearch", searchArgs(find, "", kSearchFindAll, matchCase));
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait_for(lock, std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
+    waitUntil(lock, std::chrono::steady_clock::now() + std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
     for (auto it = searches_.rbegin(); it != searches_.rend(); ++it) {
       if (!it->found) return 0;
       try {
@@ -599,7 +747,7 @@ class Engine {
     }
     runUno(".uno:ExecuteSearch", searchArgs(find, "", kSearchFind, matchCase));
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait_for(lock, std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
+    waitUntil(lock, std::chrono::steady_clock::now() + std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
     return !searches_.empty() && searches_.back().found;
   }
 
@@ -933,7 +1081,7 @@ class Engine {
   }
 
   void waitParts(int expected) {
-    for (int i = 0; i < 100 && doc_->getParts() != expected; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    for (int i = 0; i < 100 && doc_->getParts() != expected; ++i) pause(20);
     if (doc_->getParts() != expected) failWith("io", "the engine did not report the expected number of parts");
   }
 
@@ -960,7 +1108,7 @@ class Engine {
       bool same = doc_->getParts() == parts;
       for (int i = 0; same && i < parts; ++i) same = takeString(doc_->getPartHash(i)) == expected[static_cast<size_t>(i)];
       if (same) return;
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      pause(20);
     }
     failWith("io", "slide order after the move does not match the request");
   }
@@ -993,6 +1141,50 @@ void seedProfile(const std::string& profileDir) {
          "<item oor:path=\"/org.openoffice.Office.Views/Windows\"><node oor:name=\"26100\" oor:op=\"replace\">"
          "<prop oor:name=\"Visible\" oor:op=\"fuse\"><value>false</value></prop></node></item>\n"
          "</oor:items>\n";
+}
+
+
+/** 处理一帧请求。返回 false = 收到 shutdown,调用方应当退出 */
+bool handleFrame(Engine& engine, const std::string& frame) {
+  Json request;
+  try {
+    request = ncw::parseJson(frame);
+  } catch (const std::exception&) {
+    return true;  // 没有 id 可回,丢弃
+  }
+  const Json* idValue = request.get("id");
+  if (idValue == nullptr || !idValue->isNumber()) return true;
+  double id = idValue->number;
+  std::string method = request.str("method");
+  std::fprintf(stderr, "[ncw-office-helper] request %s\n", method.c_str());
+  std::fflush(stderr);
+  const Json* params = request.get("params");
+  static const Json kEmpty;
+  const Json& p = params != nullptr ? *params : kEmpty;
+  try {
+    if (method == "document.open") {
+      respondOk(id, engine.open(p.str("path"), p.str("format")));
+    } else if (method == "document.apply") {
+      const Json* operations = p.get("operations");
+      std::string results = engine.apply(operations != nullptr ? *operations : kEmpty);
+      respondOk(id, "{\"warnings\":[],\"undoable\":false,\"results\":" + results + "}");
+    } else if (method == "document.query") {
+      respondOk(id, engine.query(p));
+    } else if (method == "document.saveAs") {
+      engine.saveAs(p.str("path"), p.str("format"));
+      respondOk(id, "{}");
+    } else if (method == "shutdown") {
+      respondOk(id, "{}");
+      return false;
+    } else {
+      respondError(id, "invalid_operation", "unknown method " + method);
+    }
+  } catch (const HelperError& error) {
+    respondError(id, error.code, error.message);
+  } catch (const std::exception& error) {
+    respondError(id, "io", error.what());
+  }
+  return true;
 }
 
 }  // namespace
@@ -1049,46 +1241,31 @@ int main(int argc, char** argv) {
   sendJson("{\"v\":1,\"event\":\"hello\",\"data\":{\"protocol\":" + std::to_string(kProtocolVersion) + ",\"engineVersion\":" + quote(version) + "}}");
 
   Engine engine(office);
+#ifdef _WIN32
+  /*
+    Windows:请求交给 LibreOffice 主线程处理(见 namespace win 的说明),本线程只负责读 stdin。
+    找不到主线程窗口时退回下面的旧路径并在 stderr 里留一句 —— 那样 Calc / Impress / Draw 会卡住。
+  */
+  static Engine* s_engine = &engine;
+  if (win::attach([](const std::string& frame) {
+        if (!handleFrame(*s_engine, frame)) {
+          std::fflush(stderr);
+          std::_Exit(0);
+        }
+      })) {
+    Engine::stage("requests are handled on the LibreOffice main thread");
+    std::string frame;
+    while (readFrame(frame)) win::post(frame);
+    // 宿主关了 stdin:给已排队的请求一点时间写完回执,然后退出
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    std::fflush(stderr);
+    std::_Exit(0);
+  }
+  Engine::stage("LibreOffice main-thread window not found; handling requests on the helper thread");
+#endif
   std::string frame;
   while (readFrame(frame)) {
-    Json request;
-    try {
-      request = ncw::parseJson(frame);
-    } catch (const std::exception&) {
-      continue;  // 没有 id 可回,丢弃
-    }
-    const Json* idValue = request.get("id");
-    if (idValue == nullptr || !idValue->isNumber()) continue;
-    double id = idValue->number;
-    std::string method = request.str("method");
-    std::fprintf(stderr, "[ncw-office-helper] request %s\n", method.c_str());
-    std::fflush(stderr);
-    const Json* params = request.get("params");
-    static const Json kEmpty;
-    const Json& p = params != nullptr ? *params : kEmpty;
-    try {
-      if (method == "document.open") {
-        respondOk(id, engine.open(p.str("path"), p.str("format")));
-      } else if (method == "document.apply") {
-        const Json* operations = p.get("operations");
-        std::string results = engine.apply(operations != nullptr ? *operations : kEmpty);
-        respondOk(id, "{\"warnings\":[],\"undoable\":false,\"results\":" + results + "}");
-      } else if (method == "document.query") {
-        respondOk(id, engine.query(p));
-      } else if (method == "document.saveAs") {
-        engine.saveAs(p.str("path"), p.str("format"));
-        respondOk(id, "{}");
-      } else if (method == "shutdown") {
-        respondOk(id, "{}");
-        break;
-      } else {
-        respondError(id, "invalid_operation", "unknown method " + method);
-      }
-    } catch (const HelperError& error) {
-      respondError(id, error.code, error.message);
-    } catch (const std::exception& error) {
-      respondError(id, "io", error.what());
-    }
+    if (!handleFrame(engine, frame)) break;
   }
   /*
     ★ _exit 而不是 return:LibreOffice 的静态析构在进程退出时会去碰已经拆掉的系统剪贴板
