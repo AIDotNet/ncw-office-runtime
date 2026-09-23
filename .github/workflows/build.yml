@@ -148,7 +148,8 @@ jobs:
           npm test 2>&1 | tee "$RUNNER_TEMP/conformance.log"
           status=${PIPESTATUS[0]}
           if [ "$status" != "0" ]; then
-            grep -v Fontconfig "$RUNNER_TEMP/conformance.log" | tail -n 60 | node -e '
+            # 取前几处失败(而不是日志尾部):尾部只剩级联超时,根因在第一处
+            grep -v Fontconfig "$RUNNER_TEMP/conformance.log" | grep -A14 "not ok" | head -n 70 | node -e '
               let s = ""
               process.stdin.on("data", (d) => { s += d }).on("end", () => {
                 const e = s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")

@@ -51,7 +51,17 @@ describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, (
   after(async () => {
     await Promise.all(clients.map((client) => client.close()))
     for (const client of clients) assert.equal(client.protocolViolation, undefined, String(client.protocolViolation))
-    if (work !== '') rmSync(work, { recursive: true, force: true })
+    /*
+      ★ 清理失败不能盖掉真正的测试结果:Windows 上被杀掉的 helper 可能还没释放文件句柄,
+      rmSync 报 EBUSY 会让整个 suite 显示为 hook 失败,把第一处真实失败淹掉(CI 实测)。
+    */
+    if (work !== '') {
+      try {
+        rmSync(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 })
+      } catch (error) {
+        console.error(`[conformance] could not remove ${work}: ${error.message}`)
+      }
+    }
   })
 
   test('says hello with protocol 1 and a LibreOffice version, on a clean stdout', { timeout: TIMEOUT }, async () => {

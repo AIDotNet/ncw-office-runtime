@@ -455,7 +455,8 @@ class Engine {
         }
       }
       if (cv_.wait_until(lock, deadline) == std::cv_status::timeout && results_.empty()) {
-        failWith("timeout", command + " did not complete within the engine timeout");
+        // 带上回调计数:0 = 引擎根本没在派发回调(事件循环没跑),>0 = 只是这条命令没回执
+        failWith("timeout", command + " did not complete within the engine timeout (" + std::to_string(events_.load()) + " engine callbacks seen)");
       }
     }
   }
