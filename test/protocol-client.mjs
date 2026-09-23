@@ -51,7 +51,10 @@ export class HelperClient {
       TEMP: join(workDir, 'tmp')
     }
     for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'LANG', 'LC_ALL']) if (process.env[key] !== undefined) env[key] = process.env[key]
-    const child = spawn(helper, [`--lo-path=${loPath}`], { cwd: workDir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    // 诊断开关:NCW_HELPER_FULL_ENV=1 时把整个环境传给 helper,用来判断某个平台上的问题
+    // 是不是白名单少了变量造成的(Windows CI 上 xlsx/pptx/pdf 加载卡住时用)
+    const childEnv = process.env.NCW_HELPER_FULL_ENV === '1' ? { ...process.env, ...env } : env
+    const child = spawn(helper, [`--lo-path=${loPath}`], { cwd: workDir, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     const client = new HelperClient(child)
     await client.waitHello(timeoutMs)
     return client

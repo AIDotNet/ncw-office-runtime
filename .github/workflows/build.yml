@@ -139,6 +139,26 @@ jobs:
       - name: Build helper
         run: node scripts/build-helper.mjs
 
+      # ★ 临时诊断(Windows 上 xlsx/pptx/pdf 的 documentLoad 卡住,docx 正常)。
+      #   两个对照:LibreOffice 本身能不能在这台机器上加载 xlsx;给 helper 完整环境后是否恢复。
+      #   结果写成 warning annotation(公开可见)。定位并修复后删掉这一步。
+      - name: Windows diagnostics (non-Writer load)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          note() {
+            node -e '
+              let s = ""
+              process.stdin.on("data", (d) => { s += d }).on("end", () => {
+                console.log("::warning title=" + process.argv[1] + "::" + s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A"))
+              })' "$1"
+          }
+          lo="$(cygpath -u "$NCW_LO_PATH")"
+          mkdir -p "$RUNNER_TEMP/diag"
+          ( timeout 180 "$lo/soffice.exe" --headless --norestore --convert-to pdf --outdir "$RUNNER_TEMP/diag" test-fixtures/blank.xlsx; echo "exit=$?"; ls -la "$RUNNER_TEMP/diag" ) 2>&1 | tail -n 20 | note "soffice convert xlsx"
+          ( NCW_HELPER_FULL_ENV=1 timeout 300 node --test --test-name-pattern "xlsx" test/conformance.test.mjs; echo "exit=$?" ) 2>&1 | grep -v Fontconfig | grep -E "ok [0-9]|error|ncw-office-helper|exit=" | head -n 30 | note "helper xlsx with full env"
+
       # 失败时把输出尾部写成 annotation:job 日志要登录才能下载,annotation 在公开 API 里可见,
       # 不用拿凭据也能看到是哪一步、LibreOffice 报了什么
       - name: Protocol conformance against real LibreOffice

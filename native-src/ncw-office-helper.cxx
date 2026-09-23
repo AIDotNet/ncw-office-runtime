@@ -994,6 +994,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ncw-office-helper: cannot initialise LibreOffice at %s\n", loPath.c_str());
     return 2;
   }
+  /*
+    办公级回调只打到 stderr:加载文档期间的交互请求(密码、过滤器选项、提示框)走这里,
+    文档级回调那时还没注册。加载卡住时,宿主截到的 stderr 尾部能看出引擎在等什么。
+  */
+  office->registerCallback([](int type, const char* payload, void*) {
+    std::fprintf(stderr, "[ncw-office-helper] office callback %d %.200s\n", type, payload != nullptr ? payload : "");
+    std::fflush(stderr);
+  }, nullptr);
   std::string version = "LibreOffice";
   if (char* info = office->getVersionInfo()) {
     try {
