@@ -222,7 +222,14 @@ class Engine {
   static void onCallback(int type, const char* payload, void* data) {
     auto* self = static_cast<Engine*>(data);
     self->events_.fetch_add(1);
-    if (type != LOK_CALLBACK_UNO_COMMAND_RESULT || payload == nullptr) return;
+    if (payload == nullptr) return;
+    if (type == LOK_CALLBACK_SEARCH_RESULT_SELECTION || type == LOK_CALLBACK_SEARCH_NOT_FOUND) {
+      std::lock_guard<std::mutex> guard(self->mutex_);
+      self->searches_.push_back({type == LOK_CALLBACK_SEARCH_RESULT_SELECTION, payload});
+      self->cv_.notify_all();
+      return;
+    }
+    if (type != LOK_CALLBACK_UNO_COMMAND_RESULT) return;
     std::lock_guard<std::mutex> guard(self->mutex_);
     self->results_.emplace_back(payload);
     self->cv_.notify_all();
@@ -258,6 +265,7 @@ class Engine {
     doc->initializeForRendering("{}");
     for (int i = 0; i < 100 && events_.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (kind_ == DocKind::Text) loadParagraphStyles();
     return describe();
   }
 
@@ -265,7 +273,7 @@ class Engine {
     std::string ops;
     bool canSave = true;
     switch (kind_) {
-      case DocKind::Text: ops = "\"text.insert\""; break;
+      case DocKind::Text: ops = "\"text.insert\",\"text.findReplace\",\"paragraph.style\",\"paragraph.insert\""; break;
       case DocKind::Spreadsheet: ops = "\"cells.set\",\"cells.formula\",\"sheet.insert\""; break;
       case DocKind::Presentation: ops = "\"slide.insert\",\"slide.move\""; break;
       case DocKind::Drawing: canSave = false; break;  // PDF 经 Draw 导入,保存会重写,见文件头
@@ -288,7 +296,8 @@ class Engine {
 
   // ─────── 修改 ───────
 
-  void apply(const Json& operations) {
+  // 返回与 operations 一一对应的结果数组(JSON)
+  std::string apply(const Json& operations) {
     requireDocument();
     if (!operations.isArray() || operations.array.empty()) failWith("invalid_operation", "operations must be a non-empty array");
     // 不变式 2:先整批校验,一条不合法就一条都不执行。
@@ -298,15 +307,23 @@ class Engine {
     for (int i = 0; i < state.parts; ++i) state.names.push_back(takeString(doc_->getPartName(i)));
     for (const Json& op : operations.array) validate(op, state);
     size_t done = 0;
+    std::string results = "[";
     try {
       for (const Json& op : operations.array) {
-        execute(op);
+        std::string result = execute(op);
+        results += (done > 0 ? "," : "") + result;
         ++done;
       }
     } catch (const HelperError& error) {
+      /*
+        ★ 只有第一条就被拒、且拒绝来自「执行前的核对」(匹配数不符等)时才算文档未改动。
+        按文字定位的操作,匹配数要到执行时才能数 —— 前面的操作可能改变了它 —— 所以后面
+        那几条的核对失败只能报 io,宿主据此记为「结果未知」。
+      */
       if (done == 0 && error.code == "invalid_operation") throw;
       failWith("io", error.message + " (after " + std::to_string(done) + " operation(s) had been applied)");
     }
+    return results + "]";
   }
 
   // ─────── 查询 ───────
@@ -359,6 +376,12 @@ class Engine {
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::string> results_;
+  struct SearchEvent {
+    bool found;
+    std::string payload;
+  };
+  std::deque<SearchEvent> searches_;
+  std::vector<std::string> paragraphStyles_;
   std::atomic<int> events_{0};
 
   void requireDocument() const {
@@ -393,7 +416,7 @@ class Engine {
    * ★ 按 commandName 配对,而不是「收到任意一条就算」:引擎有时会为之前的命令迟到地
    * 补一条回执,拿它当这一条的结果,后面的读回核对就全错位了。
    */
-  void runUno(const std::string& command, const std::string& args) {
+  std::string runUno(const std::string& command, const std::string& args) {
     {
       std::lock_guard<std::mutex> guard(mutex_);
       results_.clear();
@@ -406,7 +429,7 @@ class Engine {
         std::string payload = results_.front();
         results_.pop_front();
         try {
-          if (ncw::parseJson(payload).str("commandName") == command) return;
+          if (ncw::parseJson(payload).str("commandName") == command) return payload;
         } catch (const std::exception&) {
           // 解析不了的回执不是我们等的那一条
         }
@@ -415,6 +438,125 @@ class Engine {
         failWith("timeout", command + " did not complete within the engine timeout");
       }
     }
+  }
+
+  // ─────── 查找 ───────
+
+  static constexpr int kSearchFind = 0;
+  static constexpr int kSearchFindAll = 1;
+  static constexpr int kSearchReplaceAll = 3;
+
+  /*
+    ★ 字面查找,不是正则:显式把 AlgorithmType2 设成 ABSOLUTE(1)。LibreOffice 会从 profile
+    里沿用上一次的查找选项;一旦有人在同一 profile 里开过正则,"1.5" 就会匹配到 "105"。
+    TransliterateFlags 256 = IGNORE_CASE;区分大小写时传 0。
+  */
+  static std::string searchArgs(const std::string& find, const std::string& replace, int command, bool matchCase) {
+    return "{\"SearchItem.SearchString\":{\"type\":\"string\",\"value\":" + quote(find) +
+           "},\"SearchItem.ReplaceString\":{\"type\":\"string\",\"value\":" + quote(replace) +
+           "},\"SearchItem.Backward\":{\"type\":\"boolean\",\"value\":false}" +
+           ",\"SearchItem.Command\":{\"type\":\"long\",\"value\":" + std::to_string(command) +
+           "},\"SearchItem.AlgorithmType2\":{\"type\":\"short\",\"value\":1}" +
+           ",\"SearchItem.SearchFlags\":{\"type\":\"long\",\"value\":0}" +
+           ",\"SearchItem.TransliterateFlags\":{\"type\":\"long\",\"value\":" + (matchCase ? "0" : "256") + "}}";
+  }
+
+  static bool flag(const Json& op, const char* key) {
+    const Json* value = op.get(key);
+    return value != nullptr && value->isBool() && value->boolean;
+  }
+
+  static bool contains(const std::string& haystack, const std::string& needle, bool matchCase) {
+    if (matchCase) return haystack.find(needle) != std::string::npos;
+    auto lower = [](std::string text) {
+      for (char& c : text) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+      return text;
+    };
+    return lower(haystack).find(lower(needle)) != std::string::npos;
+  }
+
+  /**
+   * 全文命中数。FIND_ALL 之后所有命中处处于选中状态(调用方可以接着对它们做事)。
+   *
+   * 命中数取自 LOK_CALLBACK_SEARCH_RESULT_SELECTION 的 searchResultSelection 数组长度;
+   * 没有命中时引擎发 SEARCH_NOT_FOUND。实测这些回调先于命令回执到达,但仍留一小段等待,
+   * 不把「回调还没到」误判成「零命中」。
+   */
+  int countMatches(const std::string& find, bool matchCase) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      searches_.clear();
+    }
+    runUno(".uno:ExecuteSearch", searchArgs(find, "", kSearchFindAll, matchCase));
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_for(lock, std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
+    for (auto it = searches_.rbegin(); it != searches_.rend(); ++it) {
+      if (!it->found) return 0;
+      try {
+        Json parsed = ncw::parseJson(it->payload);
+        const Json* selection = parsed.get("searchResultSelection");
+        if (parsed.str("searchString") == find && selection != nullptr && selection->isArray()) return static_cast<int>(selection->array.size());
+      } catch (const std::exception&) {}
+    }
+    failWith("io", "the engine did not report search results for: " + find);
+  }
+
+  /** 从光标处向后找下一处并选中它。找不到返回 false */
+  bool findNext(const std::string& find, bool matchCase) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      searches_.clear();
+    }
+    runUno(".uno:ExecuteSearch", searchArgs(find, "", kSearchFind, matchCase));
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_for(lock, std::chrono::milliseconds(1000), [this] { return !searches_.empty(); });
+    return !searches_.empty() && searches_.back().found;
+  }
+
+  /** 数命中,并按 expectedCount 与「至少一处」核对。核对失败时文档未改动。 */
+  int checkedMatches(const Json& op, const std::string& find, bool matchCase) {
+    int matches = countMatches(find, matchCase);
+    if (matches == 0) failWith("invalid_operation", "no match for: " + find);
+    const Json* expected = op.get("expectedCount");
+    if (expected != nullptr && expected->isNumber() && static_cast<int>(expected->number) != matches) {
+      failWith("invalid_operation", "expected " + std::to_string(static_cast<int>(expected->number)) + " match(es) but found " + std::to_string(matches) + ": " + find);
+    }
+    return matches;
+  }
+
+  void insertLines(const std::string& text) {
+    size_t start = 0;
+    for (;;) {
+      size_t newline = text.find('\n', start);
+      std::string line = text.substr(start, newline == std::string::npos ? std::string::npos : newline - start);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (!line.empty()) runUno(".uno:InsertText", "{\"Text\":{\"type\":\"string\",\"value\":" + quote(line) + "}}");
+      if (newline == std::string::npos) break;
+      runUno(".uno:InsertPara", "{}");
+      start = newline + 1;
+    }
+  }
+
+  // Writer 的段落样式名(程序名,如 "Heading 1"),打开文档时读一次
+  void loadParagraphStyles() {
+    char* values = doc_->getCommandValues(".uno:StyleApply");
+    std::string raw = takeString(values);
+    try {
+      Json parsed = ncw::parseJson(raw);
+      const Json* commandValues = parsed.get("commandValues");
+      const Json* styles = commandValues != nullptr ? commandValues->get("ParagraphStyles") : nullptr;
+      if (styles != nullptr && styles->isArray()) {
+        for (const Json& style : styles->array) if (style.isString()) paragraphStyles_.push_back(style.string);
+      }
+    } catch (const std::exception&) {
+      // 读不到样式表时 paragraph.style 会因「未知样式」被拒,不会误套
+    }
+  }
+
+  std::string styleSample() const {
+    std::string out;
+    for (size_t i = 0; i < paragraphStyles_.size() && i < 12; ++i) out += (i > 0 ? ", " : "") + paragraphStyles_[i];
+    return out.empty() ? "(none)" : out;
   }
 
   // ─────── 单元格地址 ───────
@@ -488,6 +630,21 @@ class Engine {
 
   void validate(const Json& op, ValidationState& state) {
     std::string kind = op.str("kind");
+    if (kind == "text.findReplace" || kind == "paragraph.style" || kind == "paragraph.insert") {
+      requireKind(DocKind::Text, kind);
+      std::string find = op.str(kind == "paragraph.insert" ? "anchor" : "find");
+      if (find.empty() || find.find_first_of("\r\n") != std::string::npos) failWith("invalid_operation", kind + " needs non-empty single-line search text");
+      if (kind == "text.findReplace" && op.str("replace").find_first_of("\r\n") != std::string::npos) failWith("invalid_operation", "replace must be single-line text");
+      if (kind == "paragraph.insert" && op.str("position") != "before" && op.str("position") != "after") failWith("invalid_operation", "position must be before or after");
+      if (kind == "paragraph.style") {
+        std::string style = op.str("style");
+        bool known = false;
+        for (const std::string& name : paragraphStyles_) known = known || name == style;
+        // ★ 未知样式名拒掉:StyleApply 对不存在的样式也回 success,文档却纹丝不动
+        if (!known) failWith("invalid_operation", "unknown paragraph style \"" + style + "\"; available: " + styleSample());
+      }
+      return;
+    }
     if (kind == "text.insert") {
       requireKind(DocKind::Text, kind);
       const Json* target = op.get("target");
@@ -560,27 +717,75 @@ class Engine {
 
   // ─────── 执行(已校验)───────
 
-  void execute(const Json& op) {
+  // 返回这一条的结果对象(JSON)。按文字定位的操作带 matches,其余为 {}
+  std::string execute(const Json& op) {
     std::string kind = op.str("kind");
     if (kind == "text.insert") {
       runUno(op.str("position") == "start" ? ".uno:GoToStartOfDoc" : ".uno:GoToEndOfDoc", "{}");
-      std::string text = op.str("text");
-      size_t start = 0;
-      for (;;) {
-        size_t newline = text.find('\n', start);
-        std::string line = text.substr(start, newline == std::string::npos ? std::string::npos : newline - start);
-        if (!line.empty()) runUno(".uno:InsertText", "{\"Text\":{\"type\":\"string\",\"value\":" + quote(line) + "}}");
-        if (newline == std::string::npos) break;
-        runUno(".uno:InsertPara", "{}");
-        start = newline + 1;
+      insertLines(op.str("text"));
+      return "{}";
+    }
+    if (kind == "text.findReplace") {
+      std::string find = op.str("find");
+      std::string replace = op.str("replace");
+      bool matchCase = flag(op, "matchCase");
+      int matches = checkedMatches(op, find, matchCase);
+      runUno(".uno:ExecuteSearch", searchArgs(find, replace, kSearchReplaceAll, matchCase));
+      doc_->resetSelection();
+      /*
+        ★ 读回核对:替换之后原文应当一处不剩。回执里的 success 对这条命令并不说明
+        「全部替换了」。替换串本身包含查找串时(例如 a → ab)跳过,那种情况下剩余数不是 0。
+      */
+      if (!contains(replace, find, matchCase) && countMatches(find, matchCase) != 0) {
+        failWith("io", "text was still found after replacing: " + find);
       }
-      return;
+      doc_->resetSelection();
+      return "{\"matches\":" + std::to_string(matches) + "}";
+    }
+    if (kind == "paragraph.style") {
+      std::string find = op.str("find");
+      bool matchCase = flag(op, "matchCase");
+      int matches = checkedMatches(op, find, matchCase);
+      /*
+        ★ 逐处定位,并在套样式前把光标收拢到段尾。不能对 FIND_ALL 的选区直接 StyleApply:
+        实测(LibreOffice 26.8)当命中处在段首时,StyleApply 会把选中的文字删掉 ——
+        「第一章 总则」套完标题变成「 总则」,且回执 success=true。
+        同一段里有多处命中时,收拢到段尾会跳过同段其余命中,所以循环次数以命中数为上限,
+        找不到下一处就停;查找回绕到文首时重复套同一段样式,结果不变。
+      */
+      runUno(".uno:GoToStartOfDoc", "{}");
+      for (int i = 0; i < matches; ++i) {
+        if (!findNext(find, matchCase)) break;
+        runUno(".uno:GoToEndOfPara", "{}");
+        runUno(".uno:StyleApply", "{\"Style\":{\"type\":\"string\",\"value\":" + quote(op.str("style")) +
+                                     "},\"FamilyName\":{\"type\":\"string\",\"value\":\"ParagraphStyles\"}}");
+      }
+      return "{\"matches\":" + std::to_string(matches) + "}";
+    }
+    if (kind == "paragraph.insert") {
+      std::string anchor = op.str("anchor");
+      bool matchCase = flag(op, "matchCase");
+      int matches = countMatches(anchor, matchCase);
+      // ★ 锚点必须恰好一处:多处时「插在哪一处旁边」只能靠猜,猜错就是把条款插进别的章节
+      if (matches != 1) failWith("invalid_operation", "anchor must match exactly one place; found " + std::to_string(matches) + ": " + anchor);
+      runUno(".uno:GoToStartOfDoc", "{}");
+      if (!findNext(anchor, matchCase)) failWith("invalid_operation", "anchor was counted but could not be located: " + anchor);
+      if (op.str("position") == "after") {
+        runUno(".uno:GoToEndOfPara", "{}");
+        runUno(".uno:InsertPara", "{}");
+        insertLines(op.str("text"));
+      } else {
+        runUno(".uno:GoToStartOfPara", "{}");
+        insertLines(op.str("text"));
+        runUno(".uno:InsertPara", "{}");
+      }
+      return "{\"matches\":1}";
     }
     if (kind == "cells.formula") {
       selectSheet(op.str("sheet"));
       std::string formula = op.str("formula");
       enterCell(op.str("cell"), formula.rfind('=', 0) == 0 ? formula : "=" + formula);
-      return;
+      return "{}";
     }
     if (kind == "cells.set") {
       selectSheet(op.str("sheet"));
@@ -607,7 +812,7 @@ class Engine {
           }
         }
       }
-      return;
+      return "{}";
     }
     if (kind == "sheet.insert") {
       int before = doc_->getParts();
@@ -617,7 +822,7 @@ class Engine {
       runUno(".uno:Insert", "{\"Name\":{\"type\":\"string\",\"value\":" + quote(name) + "},\"Index\":{\"type\":\"long\",\"value\":" + std::to_string(position) + "}}");
       waitParts(before + 1);
       if (takeString(doc_->getPartName(position - 1)) != name) failWith("io", "sheet was not inserted where expected");
-      return;
+      return "{}";
     }
     if (kind == "slide.insert") {
       int before = doc_->getParts();
@@ -627,12 +832,14 @@ class Engine {
       runUno(".uno:InsertPage", "{}");
       waitParts(before + 1);
       if (index == 0) moveSlide(1, 0);
-      return;
+      return "{}";
     }
     if (kind == "slide.move") {
       moveSlide(static_cast<int>(op.get("from")->number), static_cast<int>(op.get("to")->number));
-      return;
+      return "{}";
     }
+    // validate 已拦下所有未知操作;走到这里说明两边的操作表不同步了
+    failWith("unsupported_operation", "operation " + kind + " passed validation but has no executor");
   }
 
   void waitParts(int expected) {
@@ -734,8 +941,8 @@ int main(int argc, char** argv) {
         respondOk(id, engine.open(p.str("path"), p.str("format")));
       } else if (method == "document.apply") {
         const Json* operations = p.get("operations");
-        engine.apply(operations != nullptr ? *operations : kEmpty);
-        respondOk(id, "{\"warnings\":[],\"undoable\":false}");
+        std::string results = engine.apply(operations != nullptr ? *operations : kEmpty);
+        respondOk(id, "{\"warnings\":[],\"undoable\":false,\"results\":" + results + "}");
       } else if (method == "document.query") {
         respondOk(id, engine.query(p));
       } else if (method == "document.saveAs") {

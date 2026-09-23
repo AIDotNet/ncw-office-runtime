@@ -17,6 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { HelperClient } from './protocol-client.mjs'
+import { docxParagraphs } from './zip.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const exe = process.platform === 'win32' ? 'ncw-office-helper.exe' : 'ncw-office-helper'
@@ -64,7 +65,7 @@ describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, (
     const out = join(work, 'report-saved.docx')
     const writer = await start()
     const opened = await writer.request('document.open', { path: file, format: 'docx' })
-    assert.deepEqual(opened.capabilities.operations, ['text.insert'])
+    assert.deepEqual(opened.capabilities.operations, ['text.insert', 'text.findReplace', 'paragraph.style', 'paragraph.insert'])
     assert.equal(opened.capabilities.canSave, true)
     await writer.request('document.apply', {
       operations: [{ kind: 'text.insert', target: { generation: 1, ref: 'document' }, position: 'end', text: '第一段 hello\n第二段 world' }]
@@ -76,6 +77,55 @@ describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, (
     const { text } = await reader.request('document.query', { kind: 'text' })
     assert.match(text, /第一段 hello/)
     assert.match(text, /第二段 world/)
+  })
+
+  test('.docx: find/replace, style by match and insert around an anchor, verified after reopen', { timeout: TIMEOUT }, async () => {
+    const file = fixture('docx', 'contract.docx')
+    const out = join(work, 'contract-saved.docx')
+    const writer = await start()
+    await writer.request('document.open', { path: file, format: 'docx' })
+    await writer.request('document.apply', {
+      operations: [{ kind: 'text.insert', target: { generation: 1, ref: 'document' }, position: 'end', text: '第一章 总则\n甲方 Alpha 签署\n甲方 alpha 付款 1.5 万\n附件 105 页' }]
+    })
+    const applied = await writer.request('document.apply', {
+      operations: [
+        { kind: 'text.findReplace', find: '甲方', replace: '客户', expectedCount: 2 },
+        { kind: 'text.findReplace', find: 'Alpha', replace: 'ACME', matchCase: true },
+        { kind: 'paragraph.style', find: '第一章', style: 'Heading 1', expectedCount: 1 },
+        { kind: 'paragraph.insert', anchor: '付款', position: 'after', text: '新增条款 A\n新增条款 B' },
+        { kind: 'paragraph.insert', anchor: '附件', position: 'before', text: '前置说明' }
+      ]
+    })
+    assert.deepEqual(applied.results.map((r) => r.matches), [2, 1, 1, 1, 1])
+    await writer.request('document.saveAs', { path: out, format: 'docx' })
+
+    const reader = await start()
+    await reader.request('document.open', { path: out, format: 'docx' })
+    const { text } = await reader.request('document.query', { kind: 'text' })
+    // 标题段在纯文本里会带编号/缩进前缀(空白),那不是文档内容,按行去掉首尾空白再比
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== '')
+    assert.deepEqual(lines, ['第一章 总则', '客户 ACME 签署', '客户 alpha 付款 1.5 万', '新增条款 A', '新增条款 B', '前置说明', '附件 105 页'])
+    // 样式从文本里看不出来,直接看保存出的 document.xml
+    const styled = docxParagraphs(out).filter((p) => p.text !== '')
+    assert.equal(styled.find((p) => p.text === '第一章 总则')?.style, 'Heading1')
+    assert.ok(styled.filter((p) => p.text !== '第一章 总则').every((p) => p.style !== 'Heading1'), JSON.stringify(styled))
+  })
+
+  test('.docx: search is literal, counts are enforced, unknown styles and ambiguous anchors are refused', { timeout: TIMEOUT }, async () => {
+    const file = fixture('docx', 'guard.docx')
+    const client = await start()
+    await client.request('document.open', { path: file, format: 'docx' })
+    await client.request('document.apply', {
+      operations: [{ kind: 'text.insert', target: { generation: 1, ref: 'document' }, position: 'end', text: '价格 105 元\n备注 甲方\n备注 乙方' }]
+    })
+    const before = (await client.request('document.query', { kind: 'text' })).text
+    // "1.5" 在正则下会命中 "105";字面查找必须零命中并整批拒绝
+    await assert.rejects(client.request('document.apply', { operations: [{ kind: 'text.findReplace', find: '1.5', replace: 'x' }] }), (e) => e.code === 'invalid_operation')
+    await assert.rejects(client.request('document.apply', { operations: [{ kind: 'text.findReplace', find: '备注', replace: 'x', expectedCount: 1 }] }), (e) => e.code === 'invalid_operation' && /found 2/.test(e.message))
+    await assert.rejects(client.request('document.apply', { operations: [{ kind: 'paragraph.style', find: '价格', style: 'No Such Style' }] }), (e) => e.code === 'invalid_operation')
+    await assert.rejects(client.request('document.apply', { operations: [{ kind: 'paragraph.insert', anchor: '备注', position: 'after', text: 'x' }] }), (e) => e.code === 'invalid_operation' && /exactly one/.test(e.message))
+    const after = (await client.request('document.query', { kind: 'text' })).text
+    assert.equal(after, before)
   })
 
   test('.xlsx: literal cells stay literal, formulas compute, sheets insert', { timeout: TIMEOUT }, async () => {
