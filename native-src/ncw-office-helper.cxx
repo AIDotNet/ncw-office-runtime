@@ -45,6 +45,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -94,15 +95,31 @@ void writeAll(int fd, const char* data, size_t size) {
   }
 }
 
-void sendJson(const std::string& json) {
-  std::lock_guard<std::mutex> guard(g_writeMutex);
-  uint32_t length = static_cast<uint32_t>(json.size());
+void writeFrame(unsigned char type, const char* data, size_t size) {
+  uint32_t length = static_cast<uint32_t>(size);
   unsigned char header[5] = {
     static_cast<unsigned char>(length >> 24), static_cast<unsigned char>(length >> 16),
-    static_cast<unsigned char>(length >> 8), static_cast<unsigned char>(length), 0
+    static_cast<unsigned char>(length >> 8), static_cast<unsigned char>(length), type
   };
   writeAll(g_protocolOut, reinterpret_cast<const char*>(header), 5);
-  writeAll(g_protocolOut, json.data(), json.size());
+  writeAll(g_protocolOut, data, size);
+}
+
+void sendJson(const std::string& json) {
+  std::lock_guard<std::mutex> guard(g_writeMutex);
+  writeFrame(0, json.data(), json.size());
+}
+
+/**
+ * 带二进制附件的回执:先发附件帧(类型 1),紧接着发回执 JSON(`result.attachment: true`)。
+ *
+ * ★ 两帧在同一把锁里连续写:宿主按「回执之前最近的那一个二进制帧」配对附件。中间要是插进
+ *   另一条回执,附件就会配给错的请求 —— 表现为画布上出现另一页的内容。
+ */
+void sendWithAttachment(const std::string& json, const std::vector<unsigned char>& bytes) {
+  std::lock_guard<std::mutex> guard(g_writeMutex);
+  writeFrame(1, reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  writeFrame(0, json.data(), json.size());
 }
 
 bool readExact(char* buffer, size_t size) {
@@ -126,6 +143,12 @@ bool readFrame(std::string& json) {
     if (length > 0 && !readExact(&payload[0], length)) return false;
     if (header[4] == 0) { json.swap(payload); return true; }
   }
+}
+
+void respondOkWithAttachment(double id, const std::string& resultJson, const std::vector<unsigned char>& bytes) {
+  char idbuf[32];
+  std::snprintf(idbuf, sizeof idbuf, "%.0f", id);
+  sendWithAttachment(std::string("{\"v\":1,\"id\":") + idbuf + ",\"ok\":true,\"result\":" + resultJson + "}", bytes);
 }
 
 void respondOk(double id, const std::string& resultJson) {
@@ -517,6 +540,7 @@ class Engine {
       maxChars = static_cast<size_t>(limit->number);
     }
     if (kind == "outline") return describe();
+    if (kind == "layout") return layout(params);
     if (kind == "text") {
       if (kind_ != DocKind::Text) failWith("unsupported_operation", "text query is only available for word processing documents");
       runUno(".uno:SelectAll", "{}");
@@ -533,6 +557,113 @@ class Engine {
       return clipped(selectionText(), maxChars);
     }
     failWith("invalid_operation", "unknown query kind: " + kind);
+  }
+
+  // ─────── 渲染 ───────
+
+  /*
+    需求:办公编辑器要像 Office 一样显示真实页面(排版、字体、图片都由引擎算),所以视图
+    向引擎要「这一块区域画成多少像素」的位图。坐标用 twips(1/1440 英寸,LibreOffice 的
+    文档坐标),像素尺寸由视图按缩放决定 —— 引擎只负责画,不关心窗口多大。
+
+    ★ 单次渲染的像素上限:一次 2048×2048 RGBA 是 16 MiB,已经是分帧上限的四分之一。
+      更大的区域视图要按块(tile)切开要,否则一次 8K 渲染就让 helper 分配 256 MiB。
+  */
+  static constexpr int kMaxRenderPixels = 2048;
+  static constexpr long kMaxTwips = 1L << 30;
+
+  /**
+   * 版面:当前 / 指定部分的文档尺寸(twips);Writer 另给每一页的矩形。
+   * ★ 量尺寸要切到那个部分(getDocumentSize 只回答当前部分),量完切回原来的部分 ——
+   *   查询不应该改变编辑状态,否则 Agent 查一次版面,接下来的单元格写入就落到了别的表上。
+   */
+  std::string layout(const Json& params) {
+    int parts = doc_->getParts();
+    int original = doc_->getPart();
+    int part = original;
+    if (const Json* value = params.get("part"); value != nullptr) {
+      if (kind_ == DocKind::Text) failWith("invalid_operation", "word processing documents have no parts; omit part");
+      if (!value->isNumber() || value->number < 0 || value->number >= parts) failWith("invalid_operation", "part is out of range");
+      part = static_cast<int>(value->number);
+    }
+    if (part != original) doc_->setPart(part);
+    long width = 0;
+    long height = 0;
+    doc_->getDocumentSize(&width, &height);
+    if (part != original) doc_->setPart(original);
+    std::string out = "{\"documentType\":" + quote(kindName(kind_)) + ",\"parts\":" + std::to_string(parts) +
+                      ",\"part\":" + std::to_string(part) + ",\"width\":" + std::to_string(width) + ",\"height\":" + std::to_string(height);
+    if (kind_ == DocKind::Text) out += ",\"pages\":" + pageRectangles();
+    return out + "}";
+  }
+
+  /** Writer 的页面矩形,`[{x,y,width,height}]`(twips)。解析不了的片段跳过 */
+  std::string pageRectangles() {
+    std::string raw = takeString(doc_->getPartPageRectangles());
+    std::string out = "[";
+    size_t start = 0;
+    int count = 0;
+    while (start < raw.size() && count < 10000) {
+      size_t end = raw.find(';', start);
+      std::string item = raw.substr(start, end == std::string::npos ? std::string::npos : end - start);
+      long v[4] = {0, 0, 0, 0};
+      if (std::sscanf(item.c_str(), " %ld , %ld , %ld , %ld", &v[0], &v[1], &v[2], &v[3]) == 4 && v[2] > 0 && v[3] > 0) {
+        out += std::string(count > 0 ? "," : "") + "{\"x\":" + std::to_string(v[0]) + ",\"y\":" + std::to_string(v[1]) +
+               ",\"width\":" + std::to_string(v[2]) + ",\"height\":" + std::to_string(v[3]) + "}";
+        ++count;
+      }
+      if (end == std::string::npos) break;
+      start = end + 1;
+    }
+    return out + "]";
+  }
+
+  struct Rendered {
+    int width;
+    int height;
+    std::vector<unsigned char> rgba;
+  };
+
+  /**
+   * 把一块文档区域画成 RGBA(非预乘,每行 width*4 字节,无填充)—— 视图直接塞进 ImageData。
+   *
+   * ★ 引擎给的是**预乘** alpha 的 BGRA(或 RGBA,看 getTileMode):不转成非预乘,半透明的
+   *   抗锯齿边缘在 canvas 上会发暗发脏;不换通道,整页红蓝对调。
+   */
+  Rendered render(const Json& params) {
+    requireDocument();
+    auto number = [&](const char* key, double min, double max) -> long {
+      const Json* value = params.get(key);
+      if (value == nullptr || !value->isNumber() || value->number < min || value->number > max || value->number != static_cast<double>(static_cast<long>(value->number))) {
+        failWith("invalid_operation", std::string(key) + " must be an integer between " + std::to_string(static_cast<long>(min)) + " and " + std::to_string(static_cast<long>(max)));
+      }
+      return static_cast<long>(value->number);
+    };
+    long x = number("x", 0, kMaxTwips);
+    long y = number("y", 0, kMaxTwips);
+    long tileWidth = number("tileWidth", 1, kMaxTwips);
+    long tileHeight = number("tileHeight", 1, kMaxTwips);
+    int width = static_cast<int>(number("width", 1, kMaxRenderPixels));
+    int height = static_cast<int>(number("height", 1, kMaxRenderPixels));
+    Rendered out{width, height, std::vector<unsigned char>(static_cast<size_t>(width) * static_cast<size_t>(height) * 4, 0)};
+    const Json* partValue = params.get("part");
+    if (partValue != nullptr && kind_ != DocKind::Text) {
+      int part = static_cast<int>(number("part", 0, doc_->getParts() - 1));
+      doc_->paintPartTile(out.rgba.data(), part, 0, width, height, static_cast<int>(x), static_cast<int>(y), static_cast<int>(tileWidth), static_cast<int>(tileHeight));
+    } else {
+      if (partValue != nullptr) failWith("invalid_operation", "word processing documents have no parts; omit part");
+      doc_->paintTile(out.rgba.data(), width, height, static_cast<int>(x), static_cast<int>(y), static_cast<int>(tileWidth), static_cast<int>(tileHeight));
+    }
+    const bool bgra = doc_->getTileMode() == LOK_TILEMODE_BGRA;
+    for (size_t i = 0; i + 3 < out.rgba.size(); i += 4) {
+      unsigned char* px = &out.rgba[i];
+      if (bgra) std::swap(px[0], px[2]);
+      unsigned a = px[3];
+      if (a != 0 && a != 255) {
+        for (int c = 0; c < 3; ++c) px[c] = static_cast<unsigned char>(std::min(255u, (px[c] * 255u + a / 2) / a));
+      }
+    }
+    return out;
   }
 
   // ─────── 保存 ───────
@@ -1145,6 +1276,60 @@ void seedProfile(const std::string& profileDir) {
          "</oor:items>\n";
 }
 
+/** `--name=value` 形式的可选参数;没有返回空串 */
+std::string optionValue(int argc, char** argv, const std::string& name) {
+  const std::string prefix = "--" + name + "=";
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg.rfind(prefix, 0) == 0) return arg.substr(prefix.size());
+  }
+  return "";
+}
+
+#ifdef __APPLE__
+std::string xmlEscape(const std::string& text) {
+  std::string out;
+  for (char c : text) {
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else out += c;
+  }
+  return out;
+}
+
+/**
+ * macOS:让 LibreOfficeKit 找得到系统字体。必须在 lok_init 之前调。
+ *
+ * 需求:LibreOfficeKit 在 macOS 上走无头渲染后端,字体经它自带的 fontconfig 查找,而那份
+ * fontconfig 没有任何字体目录配置;LibreOffice 自带的字体里又没有 CJK。结果是中文一律画成
+ * 方框(实测:标题「第一章 总则」整行是豆腐块),日文、韩文同理。这里写一份只列系统字体目录
+ * 的 fonts.conf,并用 FONTCONFIG_FILE 指给 LibreOffice。
+ *
+ * - 用户自己装的字体(~/Library/Fonts)不在里面:helper 的 HOME 是私有目录,拿不到真实家目录。
+ * - 缓存目录优先用宿主给的 `--cache-dir=`(各 helper 共用,只有第一次打开要扫描系统字体,
+ *   约 1–3 秒);没给就放在 profile 里,每次打开都要重扫一遍。
+ * - 调用方已经设了 FONTCONFIG_FILE 时不覆盖(开发者自己排查字体问题时要能换配置)。
+ */
+void configureFonts(const std::string& profileDir, const std::string& cacheDir) {
+  if (std::getenv("FONTCONFIG_FILE") != nullptr) return;
+  namespace fs = std::filesystem;
+  std::error_code error;
+  fs::path dir = fs::u8path(profileDir);
+  fs::create_directories(dir, error);
+  fs::path config = dir / "fonts.conf";
+  std::string cache = cacheDir.empty() ? (dir / "fontconfig-cache").u8string() : cacheDir;
+  std::ofstream out(config, std::ios::binary | std::ios::trunc);
+  out << "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n<fontconfig>\n"
+         "  <dir>/System/Library/Fonts</dir>\n"
+         "  <dir>/Library/Fonts</dir>\n"
+         "  <cachedir>" << xmlEscape(cache) << "</cachedir>\n"
+         "</fontconfig>\n";
+  out.close();
+  if (out) setenv("FONTCONFIG_FILE", config.u8string().c_str(), 1);
+}
+#endif
+
 
 /** 处理一帧请求。返回 false = 收到 shutdown,调用方应当退出 */
 bool handleFrame(Engine& engine, const std::string& frame) {
@@ -1172,6 +1357,10 @@ bool handleFrame(Engine& engine, const std::string& frame) {
       respondOk(id, "{\"warnings\":[],\"undoable\":false,\"results\":" + results + "}");
     } else if (method == "document.query") {
       respondOk(id, engine.query(p));
+    } else if (method == "document.render") {
+      Engine::Rendered image = engine.render(p);
+      respondOkWithAttachment(id, "{\"width\":" + std::to_string(image.width) + ",\"height\":" + std::to_string(image.height) +
+                                      ",\"format\":\"rgba\",\"attachment\":true}", image.rgba);
     } else if (method == "document.saveAs") {
       engine.saveAs(p.str("path"), p.str("format"));
       respondOk(id, "{}");
@@ -1204,6 +1393,9 @@ int main(int argc, char** argv) {
 
   std::string home = std::getenv("HOME") != nullptr ? std::getenv("HOME") : ".";
   seedProfile(home + "/lo-profile");
+#ifdef __APPLE__
+  configureFonts(home + "/lo-profile", optionValue(argc, argv, "cache-dir"));
+#endif
   std::string profile = fileUrl(home + "/lo-profile");
   std::string loPath = libreOfficePath(argc, argv);
 #ifdef _WIN32

@@ -221,4 +221,71 @@ describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, (
     const outline = await client.request('document.query', { kind: 'outline' })
     assert.equal(outline.parts, opened.parts)
   })
+
+  test('.docx: renders the first page with its text, as straight RGBA of the requested size', { timeout: TIMEOUT }, async () => {
+    const file = fixture('docx', 'render.docx')
+    const client = await start()
+    await client.request('document.open', { path: file, format: 'docx' })
+    await client.request('document.apply', {
+      operations: [{ kind: 'text.insert', target: { generation: 1, ref: 'document' }, position: 'end', text: 'RENDER ME 渲染测试' }]
+    })
+    const layout = await client.request('document.query', { kind: 'layout' })
+    assert.equal(layout.documentType, 'text')
+    assert.ok(layout.pages.length >= 1)
+    const page = layout.pages[0]
+    const width = 400
+    const height = Math.round((width * page.height) / page.width)
+    const image = await client.request('document.render', { x: page.x, y: page.y, tileWidth: page.width, tileHeight: page.height, width, height })
+    assert.equal(image.format, 'rgba')
+    assert.deepEqual([image.width, image.height], [width, height])
+    assert.equal(image.bytes.length, width * height * 4)
+    const dark = (x, y) => { const i = (y * width + x) * 4; return image.bytes[i] < 128 && image.bytes[i + 1] < 128 && image.bytes[i + 2] < 128 && image.bytes[i + 3] > 200 }
+    // 文字在页面上方:上方十分之一里要有深色像素;页面底部角落是空白纸
+    let inked = 0
+    for (let y = 0; y < Math.round(height / 10); y++) for (let x = 0; x < width; x++) if (dark(x, y)) inked++
+    assert.ok(inked > 20, `expected text pixels near the top of the page, got ${inked}`)
+    // 取页内一点而不是贴边的像素:贴边处有页框与抗锯齿(实测 253),那不是内容
+    const blank = (Math.round(height * 0.9) * width + Math.round(width * 0.8)) * 4
+    const [r, g, b, a] = image.bytes.subarray(blank, blank + 4)
+    assert.ok(r >= 245 && g >= 245 && b >= 245 && a === 255, `expected blank paper low on the page, got ${[r, g, b, a]}`)
+  })
+
+  test('.xlsx / .pptx: layout and render take a part without changing the part being edited', { timeout: TIMEOUT }, async () => {
+    const sheetFile = fixture('xlsx', 'render.xlsx')
+    const sheets = await start()
+    const opened = await sheets.request('document.open', { path: sheetFile, format: 'xlsx' })
+    const first = opened.partNames[0]
+    await sheets.request('document.apply', { operations: [{ kind: 'sheet.insert', name: 'Data' }, { kind: 'cells.set', sheet: first, range: 'A1', values: [['value']] }] })
+    const layout = await sheets.request('document.query', { kind: 'layout', part: 1 })
+    assert.equal(layout.part, 1)
+    const image = await sheets.request('document.render', { part: 0, x: 0, y: 0, tileWidth: 3000, tileHeight: 1500, width: 200, height: 100 })
+    assert.equal(image.bytes.length, 200 * 100 * 4)
+    // 查询 / 渲染之后接着写单元格,仍落在按名字选中的那张表上(读回核对)
+    await sheets.request('document.apply', { operations: [{ kind: 'cells.set', sheet: first, range: 'B1', values: [['still here']] }] })
+    const { text } = await sheets.request('document.query', { kind: 'cells', sheet: first, range: 'A1:B1' })
+    assert.deepEqual(text.trim().split('\t'), ['value', 'still here'])
+
+    const deckFile = fixture('pptx', 'render.pptx')
+    const deck = await start()
+    await deck.request('document.open', { path: deckFile, format: 'pptx' })
+    const slide = await deck.request('document.query', { kind: 'layout', part: 0 })
+    assert.ok(slide.width > 0 && slide.height > 0)
+    const rendered = await deck.request('document.render', { part: 0, x: 0, y: 0, tileWidth: slide.width, tileHeight: slide.height, width: 320, height: 180 })
+    assert.equal(rendered.bytes.length, 320 * 180 * 4)
+  })
+
+  test('render refuses oversized canvases, parts on text documents, and out-of-range parts', { timeout: TIMEOUT }, async () => {
+    const file = fixture('docx', 'limits.docx')
+    const client = await start()
+    await client.request('document.open', { path: file, format: 'docx' })
+    const base = { x: 0, y: 0, tileWidth: 1000, tileHeight: 1000 }
+    await assert.rejects(client.request('document.render', { ...base, width: 4096, height: 10 }), (e) => e.code === 'invalid_operation')
+    await assert.rejects(client.request('document.render', { ...base, width: 10, height: 10, part: 0 }), (e) => e.code === 'invalid_operation')
+    await assert.rejects(client.request('document.query', { kind: 'layout', part: 0 }), (e) => e.code === 'invalid_operation')
+    await assert.rejects(client.request('document.render', { ...base, x: -1, width: 10, height: 10 }), (e) => e.code === 'invalid_operation')
+    // 被拒之后通道仍然可用:下一个请求照常拿到附件,没有和上一条错位
+    const ok = await client.request('document.render', { ...base, width: 10, height: 10 })
+    assert.equal(ok.bytes.length, 400)
+  })
+
 })

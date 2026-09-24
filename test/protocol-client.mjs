@@ -79,7 +79,8 @@ export class HelperClient {
       if (this.buffer.length < 5 + length) return
       const payload = this.buffer.subarray(5, 5 + length)
       this.buffer = this.buffer.subarray(5 + length)
-      if (type !== 0) continue
+      // 二进制帧是紧随其后那条回执的附件(渲染出的位图),见 helper 的 sendWithAttachment
+      if (type === 1) { this.attachment = Buffer.from(payload); continue }
       let message
       try {
         message = JSON.parse(payload.toString('utf8'))
@@ -93,7 +94,12 @@ export class HelperClient {
       const pending = this.pending.get(message.id)
       if (pending === undefined) continue
       this.pending.delete(message.id)
-      if (message.ok === true) pending.resolve(message.result)
+      if (message.ok === true && message.result?.attachment === true) {
+        const bytes = this.attachment
+        this.attachment = undefined
+        if (bytes === undefined) pending.reject(new ProtocolError('response announced an attachment but none preceded it'))
+        else pending.resolve({ ...message.result, bytes })
+      } else if (message.ok === true) pending.resolve(message.result)
       else pending.reject(Object.assign(new Error(message.error?.message ?? 'error'), { code: message.error?.code }))
     }
   }
