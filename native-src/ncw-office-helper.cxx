@@ -1307,8 +1307,8 @@ std::string xmlEscape(const std::string& text) {
  * 的 fonts.conf,并用 FONTCONFIG_FILE 指给 LibreOffice。
  *
  * - 用户自己装的字体(~/Library/Fonts)不在里面:helper 的 HOME 是私有目录,拿不到真实家目录。
- * - 缓存目录优先用宿主给的 `--cache-dir=`(各 helper 共用,只有第一次打开要扫描系统字体,
- *   约 1–3 秒);没给就放在 profile 里,每次打开都要重扫一遍。
+ * - 缓存目录优先用宿主给的 `--cache-dir=`(各 helper 共用,只有第一次打开要扫描系统字体;
+ *   本机实测 hello+打开 从 3.8s 降到 3.4s);没给就放在 profile 里,每次打开都要重扫一遍。
  * - 调用方已经设了 FONTCONFIG_FILE 时不覆盖(开发者自己排查字体问题时要能换配置)。
  */
 void configureFonts(const std::string& profileDir, const std::string& cacheDir) {
