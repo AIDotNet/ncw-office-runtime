@@ -39,6 +39,8 @@ export class HelperClient {
   /**
    * 起 helper,等 hello。HOME/TMP 指向私有目录 —— 与宿主给 helper 的环境一致,
    * 否则 LibreOffice profile 会落到跑测试那个人的家目录里。
+   *
+   * `loPath` 不给 = 不传 `--lo-path`,helper 用随包的运行时(打包后的冒烟测试)。
    */
   static async start({ helper, loPath, workDir, timeoutMs = 120_000 }) {
     mkdirSync(join(workDir, 'home'), { recursive: true })
@@ -48,10 +50,13 @@ export class HelperClient {
       USERPROFILE: join(workDir, 'home'),
       TMPDIR: join(workDir, 'tmp'),
       TMP: join(workDir, 'tmp'),
-      TEMP: join(workDir, 'tmp')
+      TEMP: join(workDir, 'tmp'),
+      // 与宿主一致(native-host.ts 的 helperEnv):不往随包运行时里写 Python 字节码缓存
+      PYTHONDONTWRITEBYTECODE: '1'
     }
     for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'LANG', 'LC_ALL']) if (process.env[key] !== undefined) env[key] = process.env[key]
-    const child = spawn(helper, [`--lo-path=${loPath}`], { cwd: workDir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    const args = loPath === undefined || loPath === '' ? [] : [`--lo-path=${loPath}`]
+    const child = spawn(helper, args, { cwd: workDir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     const client = new HelperClient(child)
     await client.waitHello(timeoutMs)
     return client

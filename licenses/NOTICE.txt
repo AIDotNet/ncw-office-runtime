@@ -12,8 +12,20 @@ NextCoWork Office Runtime — third-party notices
    declarations of the LibreOfficeKit C ABI.
 
 3. LibreOffice runtime
-   NOT included in this package. The helper loads a LibreOffice installation at runtime
-   (next to the helper, or via --lo-path during development). If a LibreOffice runtime
-   is ever distributed with this plugin, its licenses (MPL-2.0, LGPL-3.0-or-later and the
-   licenses of its bundled third-party components), source-code offers and trademark
-   terms must be reviewed for that exact build and added here before release.
+   The per-platform packages (ncw.office-runtime-<version>-<platform>-<arch>.zip, built by
+   scripts/package-plugin.mjs) include an unmodified copy of the official LibreOffice build
+   published by The Document Foundation:
+     native/<platform>-<arch>/LibreOffice.app   (macOS)
+     native/<platform>-<arch>/libreoffice/      (Windows, Linux)
+   Its own license files are copied to licenses/libreoffice/ (LICENSE, LICENSE.html,
+   NOTICE, CREDITS.fodt, as present in that build). LibreOffice is licensed under
+   MPL-2.0, with parts under LGPL-3.0-or-later and the licenses of its bundled third-party
+   components listed there. Source: https://www.libreoffice.org/download/source-code/
+   "LibreOffice" is a trademark of The Document Foundation.
+
+   The helper-only development package (all platforms, no runtime) does not include it;
+   there the helper loads a local LibreOffice via --lo-path.
+
+   RELEASE BLOCKER: the redistribution obligations for the exact bundled build (source
+   offer, notices of bundled third-party components, trademark use) have not been reviewed.
+   Do not publish the per-platform packages until that review is done and recorded here.

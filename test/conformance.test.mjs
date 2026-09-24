@@ -9,6 +9,10 @@
  *   - LibreOffice:环境变量 NCW_LO_PATH,指向 program 目录
  *     (macOS 是 LibreOffice.app/Contents/Frameworks)。
  * 本地想只跑其它东西时,设 NCW_SKIP_ENGINE_TESTS=1。
+ *
+ * **打包后的冒烟测试**:设 NCW_BUNDLED_PLUGIN=<build/ncw.office-runtime 目录>,就改用包里的
+ * helper、且不传 `--lo-path` —— helper 只能用随包的 LibreOffice。CI 在跑这一遍之前会先删掉
+ * 装在系统里的那份 LibreOffice,所以这一遍通过就说明包是自足的。
  */
 import assert from 'node:assert/strict'
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -21,8 +25,9 @@ import { docxParagraphs } from './zip.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const exe = process.platform === 'win32' ? 'ncw-office-helper.exe' : 'ncw-office-helper'
-const helper = join(root, 'native', `${process.platform}-${process.arch}`, exe)
-const loPath = process.env.NCW_LO_PATH ?? (process.platform === 'darwin' ? '/Applications/LibreOffice.app/Contents/Frameworks' : '')
+const bundled = process.env.NCW_BUNDLED_PLUGIN
+const helper = join(bundled ?? root, 'native', `${process.platform}-${process.arch}`, exe)
+const loPath = bundled !== undefined ? undefined : process.env.NCW_LO_PATH ?? (process.platform === 'darwin' ? '/Applications/LibreOffice.app/Contents/Frameworks' : '')
 const skip = process.env.NCW_SKIP_ENGINE_TESTS === '1'
 const TIMEOUT = 240_000
 
@@ -44,7 +49,7 @@ function fixture(kind, name) {
 describe('ncw-office-helper protocol v1 against a real LibreOffice', { skip }, () => {
   before(() => {
     assert.ok(existsSync(helper), `helper not built: ${helper} (run node scripts/build-helper.mjs)`)
-    assert.ok(loPath !== '' && existsSync(loPath), `LibreOffice not found; set NCW_LO_PATH (got "${loPath}")`)
+    if (loPath !== undefined) assert.ok(loPath !== '' && existsSync(loPath), `LibreOffice not found; set NCW_LO_PATH (got "${loPath}")`)
     work = mkdtempSync(join(tmpdir(), 'ncw-helper-conformance-'))
   })
 

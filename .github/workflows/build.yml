@@ -2,11 +2,16 @@
 #
 # 需求:引擎是原生代码,只能在各自的平台上编译和验证;这台机器能证明的只有它自己。
 # 每个平台装官方 LibreOffice(版本与 SHA-256 锁死),编译 helper,跑 test/conformance.test.mjs。
-# 汇总 job 把四份摘要登记进清单,产出一个列齐四个平台的插件目录。
+# 汇总 job 把四份摘要登记进清单,产出一个列齐四个平台、只含 helper 的插件目录(开发用,
+# 配合本机 LibreOffice 与 --lo-path)。
 #
-# ★ 产物**不含 LibreOffice 运行时**:把几百 MB 的 LibreOffice 打进插件包,
-#   要等 NextCoWork 支持大包安装、完成代码签名与许可证审查之后再做。
-#   现在的产物只能在装了 LibreOffice 的开发机上配合 --lo-path 使用。
+# 每个平台另外产出一个**带完整 LibreOffice 的单平台插件包**(scripts/package-plugin.mjs,
+# 约 300 MB)。打完包会先删掉装在系统里的 LibreOffice,再对包里的 helper 重跑一遍一致性测试 ——
+# 这一遍通过,才说明包是自足的、装到没有 LibreOffice 的机器上也能用。
+#
+# ★ 仍未完成、发布前必须人工处理:LibreOffice 再分发的许可证审查(licenses/NOTICE.txt),
+#   以及 helper / 包的代码签名(macOS 公证、Windows Authenticode)。所以打 tag 只生成**草稿**
+#   release,由人确认之后再公开。
 #
 # ★ 升级 LibreOffice 时同时改 LO_VERSION 与四个 SHA-256(取自官方下载页的 .mirrorlist),
 #   并同步 native-src/third_party/libreofficekit 的头文件分支。版本离开 stable 目录后
@@ -17,6 +22,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -37,7 +44,8 @@ jobs:
   helper:
     name: Helper (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # 打包(复制 + 哈希 + 压缩 800 MB)与第二遍测试各要几分钟
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -139,24 +147,50 @@ jobs:
       - name: Build helper
         run: node scripts/build-helper.mjs
 
-      # 失败时把输出尾部写成 annotation:job 日志要登录才能下载,annotation 在公开 API 里可见,
-      # 不用拿凭据也能看到是哪一步、LibreOffice 报了什么
+      # 失败时把前几处失败写成 annotation(公开可见),见 .github/scripts/conformance.sh
       - name: Protocol conformance against real LibreOffice
         shell: bash
+        run: .github/scripts/conformance.sh "conformance output"
+
+      # ★ 跑完测试之后 LibreOffice.app 的签名仍须成立:helper 里的 Python 不许往运行时写
+      #   __pycache__(PYTHONDONTWRITEBYTECODE),否则打进包的就是一份签名已失效的 .app。
+      #   不加 --strict:从 DMG 复制出来的扩展属性不影响签名本身,而 zip 不带扩展属性。
+      - name: Check LibreOffice.app signature is intact (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: codesign --verify --deep "$RUNNER_TEMP/lo/LibreOffice.app"
+
+      - name: Package plugin with bundled LibreOffice
+        shell: bash
+        run: node scripts/package-plugin.mjs
+
+      # 删掉系统里的 LibreOffice,下一步只剩包里的那份可用。Linux 上 apt 装的系统依赖库保留 ——
+      # 用户的桌面环境一般都有;这一步证明的是运行时可以整个搬走,不是「零依赖」
+      - name: Remove system LibreOffice
+        shell: bash
         run: |
-          set +e
-          npm test 2>&1 | tee "$RUNNER_TEMP/conformance.log"
-          status=${PIPESTATUS[0]}
-          if [ "$status" != "0" ]; then
-            # 取前几处失败(而不是日志尾部):尾部只剩级联超时,根因在第一处
-            grep -v Fontconfig "$RUNNER_TEMP/conformance.log" | grep -A14 "not ok" | head -n 70 | node -e '
-              let s = ""
-              process.stdin.on("data", (d) => { s += d }).on("end", () => {
-                const e = s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A")
-                console.log("::error title=conformance output::" + e)
-              })'
-          fi
-          exit "$status"
+          case "$RUNNER_OS" in
+            Linux) sudo rm -rf /opt/libreoffice* ;;
+            *) rm -rf "$RUNNER_TEMP/lo" ;;
+          esac
+          echo "NCW_LO_PATH=" >> "$GITHUB_ENV"
+
+      - name: Protocol conformance against the bundled plugin
+        shell: bash
+        env:
+          NCW_BUNDLED_PLUGIN: ${{ github.workspace }}/build/ncw.office-runtime
+        run: .github/scripts/conformance.sh "bundled conformance output"
+
+      - name: Upload bundled plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.target }}
+          path: build/*.zip
+          if-no-files-found: error
+          # 每个约 300 MB,只留一周;要长期保存的走 release
+          retention-days: 7
+          # 已经是 zip,再压一遍只浪费时间
+          compression-level: 0
 
       - name: Upload helper
         uses: actions/upload-artifact@v4
@@ -214,3 +248,31 @@ jobs:
             native/
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [helper, plugin]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download bundled plugins
+        uses: actions/download-artifact@v4
+        with:
+          pattern: plugin-*
+          path: dist
+          merge-multiple: true
+
+      # ★ 只建草稿:许可证审查与代码签名还没做完(见文件头),公开发布必须由人确认
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt)
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/SHA256SUMS.txt \
+            --repo "${GITHUB_REPOSITORY}" --draft --title "${GITHUB_REF_NAME}" \
+            --notes "Per-platform ncw.office-runtime packages with a bundled LibreOffice ${LO_VERSION}. Draft: license review and code signing are still pending."
